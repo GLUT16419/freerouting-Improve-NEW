@@ -1,0 +1,23 @@
+package app.freerouting.util.gson;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.Strictness;
+import java.nio.file.Path;
+import java.time.Instant;
+
+public class GsonProvider {
+
+  public static final Gson GSON = new GsonBuilder()
+      .setPrettyPrinting()
+      .disableHtmlEscaping()
+      .registerTypeAdapter(Instant.class, new InstantTypeAdapter())
+      .registerTypeAdapter(byte[].class, new ByteArrayToBase64TypeAdapter())
+      .registerTypeAdapter(Path.class, new PathTypeAdapter())
+      .registerTypeAdapterFactory(new RouterSettingsTypeAdapterFactory())
+      .setStrictness(Strictness.LENIENT)
+      .create();
+
+  private GsonProvider() {
+  }
+}

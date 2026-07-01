@@ -98,9 +98,28 @@ public class PowerGndAutoLabeler {
       }
     }
     for (int netNo : planeNets) {
-      if (!netTypeCache.containsKey(netNo) || netTypeCache.get(netNo) == NetType.SIGNAL) {
-        netTypeCache.put(netNo, NetType.GROUND);
-        groundNets.add(netNo);
+      NetType current = netTypeCache.get(netNo);
+      if (current == NetType.POWER || current == NetType.GROUND) continue;
+      // Re-classify plane nets by their name instead of blindly marking GROUND
+      Net net = findNetByNumber(netNo);
+      if (net != null && net.name != null) {
+        NetType nameBased = NetType.fromName(net.name);
+        if (nameBased == NetType.POWER) {
+          netTypeCache.put(netNo, NetType.POWER);
+          powerNets.add(netNo);
+        } else if (nameBased == NetType.GROUND) {
+          netTypeCache.put(netNo, NetType.GROUND);
+          groundNets.add(netNo);
+        } else {
+          // If name-based classification fails, try connectivity
+          NetType connBased = determineTypeFromConnectivity(net);
+          netTypeCache.put(netNo, connBased);
+          if (connBased == NetType.GROUND) groundNets.add(netNo);
+          else if (connBased == NetType.POWER) powerNets.add(netNo);
+        }
+      } else {
+        // No name available — keep as SIGNAL rather than blindly GROUND
+        netTypeCache.put(netNo, NetType.SIGNAL);
       }
     }
   }

@@ -57,10 +57,10 @@ public class WindowLayerAssignment extends BoardSavableSubWindow {
     this.setPreferredSize(new Dimension(600, 580));
     this.setResizable(true);
 
-    // Lock algorithm to hybrid on open
+    // Lock algorithm to UTPR V7 on open
     RouterSettings rs = board_handling.getCurrentRoutingJob().routerSettings;
     if (rs != null) {
-      rs.setAlgorithm(RouterSettings.ALGORITHM_HYBRID);
+      rs.setAlgorithm(RouterSettings.ALGORITHM_UTPR);
     }
 
     JTabbedPane tabbedPane = new JTabbedPane();

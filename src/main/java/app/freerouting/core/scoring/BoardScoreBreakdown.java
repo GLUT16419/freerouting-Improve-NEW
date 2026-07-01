@@ -29,7 +29,7 @@ public final class BoardScoreBreakdown {
 
   /**
    * Penalty contribution from unrouted connections.
-   * Equals {@code incompleteCount × unroutedNetPenalty}.
+   * Equals {@code signalIncomplete × unroutedNetPenalty + powerIncomplete × powerNetPenalty + groundIncomplete × groundNetPenalty}.
    */
   public final float unroutedConnectionsPenalty;
 
@@ -81,6 +81,12 @@ public final class BoardScoreBreakdown {
   // Statistics used as input — kept for reference / formatted output.
   public final int maxConnections;
   public final int incompleteConnections;
+  /** Signal-net incomplete connections (full penalty). */
+  public final int signalIncompleteConnections;
+  /** Power-net incomplete connections (reduced penalty). */
+  public final int powerIncompleteConnections;
+  /** Ground-net incomplete connections (zero penalty when fanout is sufficient). */
+  public final int groundIncompleteConnections;
   public final int clearanceViolations;
   public final int bendCount;
   public final float totalTraceLengthMm;
@@ -90,6 +96,9 @@ public final class BoardScoreBreakdown {
       RouterScoringSettings weights,
       int maxConnections,
       int incompleteConnections,
+      int signalIncomplete,
+      int powerIncomplete,
+      int groundIncomplete,
       int clearanceViolations,
       int bendCount,
       float totalTraceLengthMm,
@@ -98,13 +107,22 @@ public final class BoardScoreBreakdown {
     this.weights = weights;
     this.maxConnections = maxConnections;
     this.incompleteConnections = incompleteConnections;
+    this.signalIncompleteConnections = signalIncomplete;
+    this.powerIncompleteConnections = powerIncomplete;
+    this.groundIncompleteConnections = groundIncomplete;
     this.clearanceViolations = clearanceViolations;
     this.bendCount = bendCount;
     this.totalTraceLengthMm = totalTraceLengthMm;
     this.viaCount = viaCount;
 
     this.maximumScore = maxConnections * weights.unroutedNetPenalty;
-    this.unroutedConnectionsPenalty = incompleteConnections * weights.unroutedNetPenalty;
+    float powerPenaltyPer = weights.powerNetPenalty != null
+        ? weights.powerNetPenalty : weights.unroutedNetPenalty;
+    float groundPenaltyPer = weights.groundNetPenalty != null
+        ? weights.groundNetPenalty : 0f;
+    this.unroutedConnectionsPenalty = signalIncomplete * weights.unroutedNetPenalty
+        + powerIncomplete * powerPenaltyPer
+        + groundIncomplete * groundPenaltyPer;
     this.clearanceViolationsPenalty = clearanceViolations * weights.clearanceViolationPenalty;
     this.bendsPenalty = bendCount * weights.bendPenalty;
     this.traceLengthCost = (float) (totalTraceLengthMm * weights.defaultPreferredDirectionTraceCost);
@@ -137,10 +155,22 @@ public final class BoardScoreBreakdown {
     }
     validateWeights(weights);
 
+    int totalIncomplete = stats.connections.incompleteCount != null
+        ? stats.connections.incompleteCount : 0;
+    int sigInc = stats.connections.signalIncompleteCount != null
+        ? stats.connections.signalIncompleteCount : totalIncomplete;
+    int pwrInc = stats.connections.powerIncompleteCount != null
+        ? stats.connections.powerIncompleteCount : 0;
+    int gndInc = stats.connections.groundIncompleteCount != null
+        ? stats.connections.groundIncompleteCount : 0;
+
     return new BoardScoreBreakdown(
         weights,
         stats.connections.maximumCount != null ? stats.connections.maximumCount : 0,
-        stats.connections.incompleteCount != null ? stats.connections.incompleteCount : 0,
+        totalIncomplete,
+        sigInc,
+        pwrInc,
+        gndInc,
         stats.clearanceViolations.totalCount != null ? stats.clearanceViolations.totalCount : 0,
         stats.bends.totalCount != null ? stats.bends.totalCount : 0,
         stats.traces.totalLength != null ? stats.traces.totalLength : 0f,
@@ -152,12 +182,31 @@ public final class BoardScoreBreakdown {
    * and test output.
    */
   public String toSummaryString() {
+    if (powerIncompleteConnections > 0 || groundIncompleteConnections > 0) {
+      return String.format(
+          "score=%.1f/1000 (raw=%.0f/%.0f) | "
+              + "unrouted=signal:%d×%.0f + power:%d×%.0f + gnd:%d×%.0f =%.0f | "
+              + "violations=%d×%.0f=%.0f | bends=%d×%.1f=%.0f | "
+              + "length=%.1fmm×%.2f=%.0f | vias=%d×%.0f=%.0f",
+          normalizedScore, rawScore, maximumScore,
+          signalIncompleteConnections, weights.unroutedNetPenalty,
+          powerIncompleteConnections,
+          weights.powerNetPenalty != null ? weights.powerNetPenalty : weights.unroutedNetPenalty,
+          groundIncompleteConnections,
+          weights.groundNetPenalty != null ? weights.groundNetPenalty : 0f,
+          unroutedConnectionsPenalty,
+          clearanceViolations, weights.clearanceViolationPenalty, clearanceViolationsPenalty,
+          bendCount, weights.bendPenalty, bendsPenalty,
+          totalTraceLengthMm, weights.defaultPreferredDirectionTraceCost, traceLengthCost,
+          viaCount, (double) weights.viaCosts, viasCost);
+    }
+    // Fallback: simple format when all incompletes are signal
     return String.format(
         "score=%.1f/1000 (raw=%.0f/%.0f) | "
             + "unrouted=%d×%.0f=%.0f | violations=%d×%.0f=%.0f | bends=%d×%.1f=%.0f | "
             + "length=%.1fmm×%.2f=%.0f | vias=%d×%.0f=%.0f",
         normalizedScore, rawScore, maximumScore,
-        incompleteConnections, weights.unroutedNetPenalty, unroutedConnectionsPenalty,
+        signalIncompleteConnections, weights.unroutedNetPenalty, unroutedConnectionsPenalty,
         clearanceViolations, weights.clearanceViolationPenalty, clearanceViolationsPenalty,
         bendCount, weights.bendPenalty, bendsPenalty,
         totalTraceLengthMm, weights.defaultPreferredDirectionTraceCost, traceLengthCost,

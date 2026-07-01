@@ -15,6 +15,7 @@ public class RouterSettings implements Serializable, Cloneable {
   public static final String ALGORITHM_CURRENT = "freerouting-router";
   public static final String ALGORITHM_V19 = "freerouting-router-v19";
   public static final String ALGORITHM_HYBRID = "hybrid-three-phase";
+  public static final String ALGORITHM_UTPR = "utpr-seven-phase";
   public static final double MIN_BEND_COST = 0.0;
   public static final double MAX_BEND_COST = 9.9;
   @SerializedName("enabled")
@@ -73,6 +74,9 @@ public class RouterSettings implements Serializable, Cloneable {
   public transient java.util.Set<Integer> netsToRoute;
   @SerializedName("hybrid")
   public HybridRouterSettings hybrid;
+  /** UTPR V7 Seven-Phase Urban Traffic Router settings. */
+  @SerializedName("utpr")
+  public app.freerouting.autoroute.UrbanTrafficRouterSettings utpr;
   // PropertyChangeSupport for bidirectional binding with GUI
   private transient PropertyChangeSupport pcs = new PropertyChangeSupport(this);
 
@@ -85,8 +89,9 @@ public class RouterSettings implements Serializable, Cloneable {
     this.scoring = new RouterScoringSettings();
     this.fanout = new FanoutSettings();
     this.hybrid = new HybridRouterSettings();
-    // Default to hybrid algorithm
-    this.algorithm = ALGORITHM_HYBRID;
+    this.utpr = new app.freerouting.autoroute.UrbanTrafficRouterSettings();
+    // Default to UTPR V7 algorithm
+    this.algorithm = ALGORITHM_UTPR;
     // Default via type: through-hole
     this.viaType = "th";
   }

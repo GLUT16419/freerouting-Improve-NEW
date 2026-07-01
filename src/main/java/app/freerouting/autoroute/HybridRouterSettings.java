@@ -68,6 +68,34 @@ public class HybridRouterSettings implements Serializable, Cloneable {
   @SerializedName("auto_label_power_gnd")
   public boolean autoLabelPowerGnd = true;
 
+  // === V6 specific settings ===
+  @SerializedName("v6_flute_enabled")
+  public boolean v6FluteEnabled = true;
+
+  @SerializedName("v6_spectral_clustering_enabled")
+  public boolean v6SpectralClusteringEnabled = true;
+
+  @SerializedName("v6_dynamic_thaw_enabled")
+  public boolean v6DynamicThawEnabled = true;
+
+  @SerializedName("v6_sat_solver_enabled")
+  public boolean v6SatSolverEnabled = true;
+
+  @SerializedName("v6_parallel_engine_enabled")
+  public boolean v6ParallelEngineEnabled = true;
+
+  @SerializedName("v6_flute_cell_size_um")
+  public int v6FluteCellSizeUm = 2000000; // 2mm grid
+
+  @SerializedName("v6_spectral_min_nets")
+  public int v6SpectralMinNets = 10;
+
+  @SerializedName("v6_max_parallel_clusters")
+  public int v6MaxParallelClusters = 6;
+
+  @SerializedName("v6_channel_retention_factor")
+  public double v6ChannelRetentionFactor = 0.3;
+
   // Routing quality vs speed tradeoff
   @SerializedName("quality_level")
   public QualityLevel qualityLevel = QualityLevel.BALANCED;
@@ -141,6 +169,16 @@ public class HybridRouterSettings implements Serializable, Cloneable {
       result.autoAssignLayerFunctions = this.autoAssignLayerFunctions;
       result.autoLabelPowerGnd = this.autoLabelPowerGnd;
       result.qualityLevel = this.qualityLevel;
+      // V6 settings
+      result.v6FluteEnabled = this.v6FluteEnabled;
+      result.v6SpectralClusteringEnabled = this.v6SpectralClusteringEnabled;
+      result.v6DynamicThawEnabled = this.v6DynamicThawEnabled;
+      result.v6SatSolverEnabled = this.v6SatSolverEnabled;
+      result.v6ParallelEngineEnabled = this.v6ParallelEngineEnabled;
+      result.v6FluteCellSizeUm = this.v6FluteCellSizeUm;
+      result.v6SpectralMinNets = this.v6SpectralMinNets;
+      result.v6MaxParallelClusters = this.v6MaxParallelClusters;
+      result.v6ChannelRetentionFactor = this.v6ChannelRetentionFactor;
       return result;
     }
   }

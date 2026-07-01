@@ -26,6 +26,7 @@ public enum NetType {
 
     // ── Ground patterns / 地网络 ──
     if (upper.equals("GND")
+        || upper.equals("GND.")
         || upper.equals("VSS")
         || upper.equals("AGND")
         || upper.equals("DGND")
@@ -38,6 +39,7 @@ public enum NetType {
         || upper.equals("GND网络")
         || upper.startsWith("GND_")
         || upper.startsWith("GND-")
+        || upper.startsWith("GND.")
         || upper.startsWith("VSS_")
         || upper.startsWith("AGND")
         || upper.startsWith("DGND")

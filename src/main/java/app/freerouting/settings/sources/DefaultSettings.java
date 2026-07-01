@@ -23,8 +23,23 @@ public class DefaultSettings implements SettingsSource {
      * Penalty subtracted from the board score for each unrouted connection.
      * This is intentionally the largest penalty so that routing completion
      * always dominates trace-length and via-count considerations.
+     * Also used as the per-connection penalty for signal nets.
      */
     public static final float DEFAULT_UNROUTED_NET_PENALTY = 5_000_000.0f;
+
+    /**
+     * Penalty per unrouted power-net connection — half of signal penalty.
+     * Power nets benefit from plane layers; incomplete connections are less
+     * critical than signal connections.
+     */
+    public static final float DEFAULT_POWER_NET_PENALTY = 2_500_000.0f;
+
+    /**
+     * Penalty per unrouted ground-net connection — zero.
+     * GND nets with fanout vias provide sufficient connectivity through
+     * ground planes; routing every connection is unnecessary.
+     */
+    public static final float DEFAULT_GROUND_NET_PENALTY = 0.0f;
 
     /**
      * Penalty subtracted from the board score for each clearance (DRC) violation.
@@ -88,7 +103,7 @@ public class DefaultSettings implements SettingsSource {
         RouterSettings settings = new RouterSettings();
 
         settings.enabled = true;
-        settings.algorithm = RouterSettings.ALGORITHM_HYBRID;
+        settings.algorithm = RouterSettings.ALGORITHM_UTPR;
         settings.jobTimeoutString = "12:00:00";
         settings.maxPasses = 9999;
         settings.maxItems = Integer.MAX_VALUE;
@@ -135,6 +150,8 @@ public class DefaultSettings implements SettingsSource {
         settings.scoring.planeViaCosts = DEFAULT_PLANE_VIA_COSTS;
         settings.scoring.startRipupCosts = DEFAULT_START_RIPUP_COSTS;
         settings.scoring.unroutedNetPenalty = DEFAULT_UNROUTED_NET_PENALTY;
+        settings.scoring.powerNetPenalty = DEFAULT_POWER_NET_PENALTY;
+        settings.scoring.groundNetPenalty = DEFAULT_GROUND_NET_PENALTY;
         settings.scoring.clearanceViolationPenalty = DEFAULT_CLEARANCE_VIOLATION_PENALTY;
         settings.scoring.bendPenalty = DEFAULT_BEND_PENALTY;
         settings.scoring.defaultBendCost = 0.0;

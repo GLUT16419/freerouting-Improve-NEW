@@ -96,6 +96,28 @@ public class NetCluster implements Serializable {
   public static List<NetCluster> clusterNets(BasicBoard board, Set<Integer> netsToCluster) {
     if (board == null || board.rules == null || board.rules.nets == null) return Collections.emptyList();
 
+    // Use spectral clustering for larger net sets
+    if (netsToCluster.size() >= 10) {
+      try {
+        SpectralClusterer spectralClusterer = new SpectralClusterer(board);
+        List<NetCluster> spectralResult = spectralClusterer.cluster(netsToCluster);
+        if (spectralResult != null && !spectralResult.isEmpty()) {
+          FRLogger.info("NetCluster.clusterNets: Spectral clustering used ("
+              + netsToCluster.size() + " nets → " + spectralResult.size() + " clusters)");
+          return spectralResult;
+        }
+      } catch (Exception e) {
+        FRLogger.debug("NetCluster.clusterNets: Spectral clustering failed, falling back to spatial: " + e.getMessage());
+      }
+    }
+
+    // Fallback: original spatial overlap clustering
+    return spatialClusterNets(board, netsToCluster);
+  }
+
+  /** Original spatial overlap clustering. */
+  private static List<NetCluster> spatialClusterNets(BasicBoard board, Set<Integer> netsToCluster) {
+
     List<NetBoundingBox> netBBs = new ArrayList<>();
     for (int netNo : netsToCluster) {
       Net net = board.rules.nets.get(netNo);

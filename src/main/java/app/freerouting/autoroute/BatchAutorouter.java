@@ -108,7 +108,7 @@ public class BatchAutorouter extends NamedAlgorithm {
    *   <li>Power/GND nets are routed last (signal nets get routing priority)</li>
    * </ul>
    */
-  private PowerGndAutoLabeler powerGndLabeler;
+  protected PowerGndAutoLabeler powerGndLabeler;
 
   private boolean isOptimizerAutorouter = false;
 
@@ -412,7 +412,13 @@ public class BatchAutorouter extends NamedAlgorithm {
         return false;
       }
 
-      boolean useSlowAlgorithm = false;
+      // Single-thread: skip deep copy overhead — route in-place via autoroute_pass.
+      // Multi-threaded deep copy via Java serialization is fragile on complex boards
+      // (can throw NotSerializableException after heavy routing). For 1 thread the
+      // board clone adds no value and only risks serialization failures.
+      if (job.routerSettings.maxThreads <= 1) {
+        return autoroute_pass(p_pass_no);
+      }
 
       BatchAutorouterThread[] autorouterThreads = new BatchAutorouterThread[job.routerSettings.maxThreads];
       BoardHistory bh = new BoardHistory(job.routerSettings.scoring);
@@ -511,7 +517,8 @@ public class BatchAutorouter extends NamedAlgorithm {
       this.air_line = null;
       return anyProgress;
     } catch (Exception e) {
-      job.logError("Something went wrong during the auto-routing", e);
+      job.logError("Something went wrong during the auto-routing (multi-threaded pass " + p_pass_no + ")", e);
+      FRLogger.error("autoroute_pass_multi_thread [pass=" + p_pass_no + "] exception", e);
       this.air_line = null;
       return false;
     }
@@ -521,7 +528,7 @@ public class BatchAutorouter extends NamedAlgorithm {
    * Auto-routes one ripup pass of all items of the board. Returns false, if the
    * board is already completely routed.
    */
-  private boolean autoroute_pass(int p_pass_no) {
+  protected boolean autoroute_pass(int p_pass_no) {
     long passStartTime = System.currentTimeMillis();
     try {
       List<Item> autoroute_item_list = getAutorouteItems(this.board);

@@ -66,6 +66,7 @@ public class WindowAutorouteParameter extends BoardSavableSubWindow {
   private final String algorithm_current;
   private final String algorithm_v19;
   private final String algorithm_hybrid;
+  private final String algorithm_utpr;
   private final JFormattedTextField[] preferred_direction_trace_cost_arr;
   private final JFormattedTextField[] against_preferred_direction_trace_cost_arr;
   private final JFormattedTextField[] bend_cost_arr;
@@ -385,7 +386,9 @@ public class WindowAutorouteParameter extends BoardSavableSubWindow {
     this.algorithm_current = tm.getText("algorithm_current");
     this.algorithm_v19 = tm.getText("algorithm_v19");
     this.algorithm_hybrid = tm.getText("algorithm_hybrid");
+    this.algorithm_utpr = tm.getText("algorithm_utpr");
     settings_autorouter_algorithm_combo_box = new JComboBox<>();
+    settings_autorouter_algorithm_combo_box.addItem(this.algorithm_utpr);
     settings_autorouter_algorithm_combo_box.addItem(this.algorithm_current);
     settings_autorouter_algorithm_combo_box.addItem(this.algorithm_hybrid);
     settings_autorouter_algorithm_combo_box.addItem(this.algorithm_v19);
@@ -545,9 +548,11 @@ public class WindowAutorouteParameter extends BoardSavableSubWindow {
     settings.setOptimizerEnabled(selected);
   }
 
-  static void applyAlgorithmSelection(RouterSettings settings, boolean useV19, boolean useHybrid) {
+  static void applyAlgorithmSelection(RouterSettings settings, boolean useV19, boolean useHybrid, boolean useUtpr) {
     String newAlgorithm;
-    if (useHybrid) {
+    if (useUtpr) {
+      newAlgorithm = RouterSettings.ALGORITHM_UTPR;
+    } else if (useHybrid) {
       newAlgorithm = RouterSettings.ALGORITHM_HYBRID;
     } else if (useV19) {
       newAlgorithm = RouterSettings.ALGORITHM_V19;
@@ -672,7 +677,9 @@ public class WindowAutorouteParameter extends BoardSavableSubWindow {
     }
 
     // Set algorithm selection
-    if (RouterSettings.ALGORITHM_V19.equals(settings.algorithm)) {
+    if (RouterSettings.ALGORITHM_UTPR.equals(settings.algorithm)) {
+      this.settings_autorouter_algorithm_combo_box.setSelectedItem(this.algorithm_utpr);
+    } else if (RouterSettings.ALGORITHM_V19.equals(settings.algorithm)) {
       this.settings_autorouter_algorithm_combo_box.setSelectedItem(this.algorithm_v19);
     } else if (RouterSettings.ALGORITHM_HYBRID.equals(settings.algorithm)) {
       this.settings_autorouter_algorithm_combo_box.setSelectedItem(this.algorithm_hybrid);
@@ -1244,16 +1251,18 @@ public class WindowAutorouteParameter extends BoardSavableSubWindow {
     public void actionPerformed(ActionEvent p_evt) {
       String oldAlgorithm = board_handling.getCurrentRoutingJob().routerSettings.algorithm;
       Object selected = settings_autorouter_algorithm_combo_box.getSelectedItem();
+      boolean useUtpr = selected == algorithm_utpr;
       boolean useV19 = selected == algorithm_v19;
       boolean useHybrid = selected == algorithm_hybrid;
-      String newAlgorithm = useHybrid ? RouterSettings.ALGORITHM_HYBRID
+      String newAlgorithm = useUtpr ? RouterSettings.ALGORITHM_UTPR
+          : useHybrid ? RouterSettings.ALGORITHM_HYBRID
           : useV19 ? RouterSettings.ALGORITHM_V19
           : RouterSettings.ALGORITHM_CURRENT;
       if (!oldAlgorithm.equals(newAlgorithm)) {
         isUpdatingFromSettings = true;
         try {
           applyAlgorithmSelection(board_handling.getCurrentRoutingJob().routerSettings,
-              useV19, useHybrid);
+              useV19, useHybrid, useUtpr);
         } finally {
           isUpdatingFromSettings = false;
         }

@@ -8,6 +8,7 @@ import app.freerouting.autoroute.BatchOptimizer;
 import app.freerouting.autoroute.BatchOptimizerMultiThreaded;
 import app.freerouting.autoroute.HybridBatchAutorouterWrapper;
 import app.freerouting.autoroute.NamedAlgorithm;
+import app.freerouting.autoroute.UrbanTrafficBatchAutorouter;
 import app.freerouting.autoroute.TaskState;
 import app.freerouting.autoroute.events.BoardUpdatedEvent;
 import app.freerouting.autoroute.events.BoardUpdatedEventListener;
@@ -206,7 +207,10 @@ public class AutorouterAndRouteOptimizerThread extends InteractiveActionThread {
 
     // Select the appropriate router algorithm based on settings
     String algorithm = routingJob.routerSettings.algorithm;
-    if (app.freerouting.settings.RouterSettings.ALGORITHM_HYBRID.equals(algorithm)) {
+    if (app.freerouting.settings.RouterSettings.ALGORITHM_UTPR.equals(algorithm)) {
+      routingJob.logInfo("Using UTPR V7 seven-phase urban traffic router: " + algorithm);
+      this.batchAutorouter = new UrbanTrafficBatchAutorouter(routingJob);
+    } else if (app.freerouting.settings.RouterSettings.ALGORITHM_HYBRID.equals(algorithm)) {
       routingJob.logInfo("Using hybrid three-phase router algorithm: " + algorithm);
       this.batchAutorouter = new HybridBatchAutorouterWrapper(routingJob);
     } else if (app.freerouting.settings.RouterSettings.ALGORITHM_V19.equals(algorithm)) {

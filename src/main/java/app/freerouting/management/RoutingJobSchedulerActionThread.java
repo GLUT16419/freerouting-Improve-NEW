@@ -154,6 +154,19 @@ public class RoutingJobSchedulerActionThread extends StoppableThread {
             job.resourceUsage.peakMemoryUsed);
 
         job.logInfo(sessionSummary);
+
+        // Log per-type incomplete breakdown (signal/power/ground)
+        if (finalStats.connections.signalIncompleteCount != null
+            || finalStats.connections.powerIncompleteCount != null
+            || finalStats.connections.groundIncompleteCount != null) {
+          int sig = finalStats.connections.signalIncompleteCount != null
+              ? finalStats.connections.signalIncompleteCount : 0;
+          int pwr = finalStats.connections.powerIncompleteCount != null
+              ? finalStats.connections.powerIncompleteCount : 0;
+          int gnd = finalStats.connections.groundIncompleteCount != null
+              ? finalStats.connections.groundIncompleteCount : 0;
+          job.logInfo("  按类型: 信号=" + sig + " 未连线, 电源=" + pwr + " 未连线, GND=" + gnd + " 未连线");
+        }
       }
 
       job.stage = RoutingStage.IDLE;

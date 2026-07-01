@@ -388,7 +388,7 @@ public abstract class PullTightAlgo {
             try {
               board.normalize_traces(curr_net_no);
             } catch (Exception e) {
-              FRLogger.error("The normalization of net '" + board.rules.nets.get(curr_net_no).name + "' failed.", e);
+              FRLogger.debug("The normalization of net '" + board.rules.nets.get(curr_net_no).name + "' failed.");
             }
 
             if (split_traces_at_keep_point()) {

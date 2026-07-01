@@ -234,6 +234,36 @@ public class BoardStatistics implements Serializable {
     this.connections.maximumCount = drc.max_connections;
     this.connections.incompleteCount = drc.getIncompleteCount();
 
+    // Compute per-type incomplete counts (signal / power / ground)
+    int sigIncomplete = 0, pwrIncomplete = 0, gndIncomplete = 0;
+    try {
+      for (int netNo = 1; netNo <= board.rules.nets.max_net_no(); netNo++) {
+        int netIncomplete = drc.getIncompleteCount(netNo);
+        if (netIncomplete > 0) {
+          app.freerouting.rules.Net net = board.rules.nets.get(netNo);
+          if (net != null && net.name != null && !net.name.isEmpty()) {
+            switch (app.freerouting.autoroute.NetType.fromName(net.name)) {
+              case GROUND: gndIncomplete += netIncomplete; break;
+              case POWER:  pwrIncomplete += netIncomplete; break;
+              default:     sigIncomplete += netIncomplete; break;
+            }
+          } else {
+            sigIncomplete += netIncomplete;
+          }
+        }
+      }
+    } catch (Exception e) {
+      // Failed to classify some nets; fall back to all-signal (no per-type).
+      // This can happen on cloned boards with transient state.
+      sigIncomplete = this.connections.incompleteCount != null
+          ? this.connections.incompleteCount : drc.getIncompleteCount();
+      pwrIncomplete = 0;
+      gndIncomplete = 0;
+    }
+    this.connections.signalIncompleteCount = sigIncomplete;
+    this.connections.powerIncompleteCount = pwrIncomplete;
+    this.connections.groundIncompleteCount = gndIncomplete;
+
     // Bends
     this.bends.totalCount = 0;
     this.bends.ninetyDegreeCount = 0;
@@ -476,7 +506,22 @@ public class BoardStatistics implements Serializable {
    */
   public float calculateScore(RouterScoringSettings scoringSettings) {
     float maximumScore = getMaximumScore(scoringSettings);
-    float penalties = this.connections.incompleteCount * scoringSettings.unroutedNetPenalty
+
+    // Per-type incomplete penalties: signal full, power half, ground zero
+    int sigIncomplete = this.connections.signalIncompleteCount != null
+        ? this.connections.signalIncompleteCount : this.connections.incompleteCount;
+    int pwrIncomplete = this.connections.powerIncompleteCount != null
+        ? this.connections.powerIncompleteCount : 0;
+    int gndIncomplete = this.connections.groundIncompleteCount != null
+        ? this.connections.groundIncompleteCount : 0;
+
+    float signalPenalty = sigIncomplete * scoringSettings.unroutedNetPenalty;
+    float powerPenalty = pwrIncomplete * (scoringSettings.powerNetPenalty != null
+        ? scoringSettings.powerNetPenalty : scoringSettings.unroutedNetPenalty);
+    float groundPenalty = gndIncomplete * (scoringSettings.groundNetPenalty != null
+        ? scoringSettings.groundNetPenalty : 0f);
+
+    float penalties = signalPenalty + powerPenalty + groundPenalty
         + this.clearanceViolations.totalCount * scoringSettings.clearanceViolationPenalty
         + this.bends.totalCount * scoringSettings.bendPenalty;
     // Use the mm-normalised trace length so that the trace-cost term is comparable

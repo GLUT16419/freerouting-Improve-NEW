@@ -5,6 +5,7 @@ import app.freerouting.board.Pin;
 import app.freerouting.board.RoutingBoard;
 import app.freerouting.board.Trace;
 import app.freerouting.board.Via;
+import app.freerouting.core.RoutingJob;
 import app.freerouting.core.StoppableThread;
 import app.freerouting.core.scoring.BoardStatistics;
 import app.freerouting.datastructures.UndoableObjects;
@@ -14,18 +15,17 @@ import app.freerouting.geometry.planar.FloatPoint;
 import app.freerouting.logger.FRLogger;
 import app.freerouting.settings.RouterSettings;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletionService;
+import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -200,10 +200,36 @@ public final class RegionRouter {
         regionSettings.netsToRoute = new HashSet<>(nets);
         regionSettings.setFanoutEnabled(false);
 
+        // Filter to only route nets whose airline length is below threshold
+        if (shortNetThreshold > 0) {
+          DesignRulesChecker drc = new DesignRulesChecker(ctx.board, null);
+          drc.calculateAllIncompletes();
+          AirLine[] airlines = drc.getAllAirlines();
+          if (airlines != null) {
+            Set<Integer> shortNets = new HashSet<>();
+            for (AirLine airline : airlines) {
+              if (airline.net != null && nets.contains(airline.net.net_number)) {
+                double dx = airline.to_corner.x - airline.from_corner.x;
+                double dy = airline.to_corner.y - airline.from_corner.y;
+                double length = Math.sqrt(dx * dx + dy * dy);
+                if (length <= shortNetThreshold) {
+                  shortNets.add(airline.net.net_number);
+                }
+              }
+            }
+            if (shortNets.isEmpty()) {
+              FRLogger.info("RegionRouter.shortRoute: Region " + rIdx + " has no short nets, skipping.");
+              return new RegionRouteResult(ctx.board, nets, rIdx, 0);
+            }
+            regionSettings.netsToRoute = shortNets;
+          }
+        }
+
         StoppableThread rt = createTrialThread();
         BatchAutorouter router = new BatchAutorouter(rt, ctx.board, regionSettings,
             true, true, settings.get_start_ripup_costs(),
             settings.trace_pull_tight_accuracy);
+        router.job = createRoutingJob(rt, regionSettings);
         router.setStagnationPassLimit(5);
         router.setStopAtPassMinimum(3);
         router.runBatchLoop();
@@ -275,97 +301,160 @@ public final class RegionRouter {
     }
 
     // Cluster all incomplete nets
-    List<NetCluster> clusters = NetCluster.clusterNets(board, incompleteNets);
-    if (clusters.isEmpty()) {
+    List<NetCluster> rawClusters = NetCluster.clusterNets(board, incompleteNets);
+    if (rawClusters.isEmpty()) {
       FRLogger.warn("RegionRouter.clusterRoute: No clusters formed.");
       return incompleteNets.size();
     }
-
     FRLogger.info("RegionRouter.clusterRoute: " + incompleteNets.size()
-        + " nets → " + clusters.size() + " clusters");
+        + " nets → " + rawClusters.size() + " raw clusters");
+
+    // Skip clusters with fewer than 3 nets — they don't benefit from parallel
+    // deep-copy routing (can't rip up other nets' traces). Phase 4c handles them.
+    List<NetCluster> clusters = new ArrayList<>();
+    int netsInSkipped = 0;
+    int skippedClusters = 0;
+    for (NetCluster c : rawClusters) {
+      if (c.getNetCount() >= 3) {
+        clusters.add(c);
+      } else {
+        netsInSkipped += c.getNetCount();
+        skippedClusters++;
+      }
+    }
+    if (skippedClusters > 0) {
+      FRLogger.info("RegionRouter.clusterRoute: Skipping " + skippedClusters
+          + " tiny clusters (" + netsInSkipped + " nets) — deferred to Phase 4c.");
+    }
+    if (clusters.isEmpty()) {
+      FRLogger.info("RegionRouter.clusterRoute: No clusters with >=3 nets, skipping Phase 4a.");
+      return incompleteNets.size();
+    }
+
+    // Fix 4: Sort clusters by net count ascending (small clusters first for quick wins)
+    clusters.sort(Comparator.comparingInt(NetCluster::getNetCount));
+
+    FRLogger.info("RegionRouter.clusterRoute: " + clusters.size()
+        + " clusters remain (sorted by size)");
 
     // Collect original item IDs before routing
     Set<Integer> originalItemIds = collectItemIds(board);
 
-    // Route each cluster independently in parallel
     int numThreads = Math.min(Runtime.getRuntime().availableProcessors(), 6);
     numThreads = Math.min(numThreads, clusters.size());
     if (numThreads <= 0) numThreads = 1;
 
-    ExecutorService executor = Executors.newFixedThreadPool(numThreads);
-    List<Future<ClusterRouteTask>> futures = new ArrayList<>();
-
-    for (int ci = 0; ci < clusters.size(); ci++) {
-      final NetCluster cluster = clusters.get(ci);
-      final int clusterIdx = ci;
-
-      futures.add(executor.submit(() -> {
-        long start = System.currentTimeMillis();
-
-        // Deep copy the board for this cluster
-        RoutingBoard clusterBoard = board.deepCopy();
-        if (clusterBoard == null) {
-          FRLogger.warn("RegionRouter.clusterRoute: deepCopy failed for cluster " + clusterIdx);
-          return null;
-        }
-
-        // Restrict routing to this cluster's nets only
-        RouterSettings clusterSettings = settings.clone();
-        clusterSettings.netsToRoute = new HashSet<>(cluster.getNetNumbers());
-        clusterSettings.setFanoutEnabled(false);
-
-        StoppableThread ct = createTrialThread();
-        BatchAutorouter router = new BatchAutorouter(ct, clusterBoard, clusterSettings,
-            true, true, settings.get_start_ripup_costs(),
-            settings.trace_pull_tight_accuracy);
-        router.setStagnationPassLimit(5);
-        router.setStopAtPassMinimum(3);
-        router.setOptimizerAutorouter(true);
-        router.runBatchLoop();
-
-        int incompletes = new DesignRulesChecker(clusterBoard, null).getIncompleteCount();
-        long duration = System.currentTimeMillis() - start;
-
-        FRLogger.info("RegionRouter.clusterRoute: Cluster " + clusterIdx + " ("
-            + cluster.getNetCount() + " nets) — " + incompletes + " incompletes, "
-            + duration + "ms");
-
-        return new ClusterRouteTask(clusterBoard, clusterIdx);
-      }));
-    }
-
-    // Collect results and merge back to main board
+    // Fix 4: Process clusters in batches for progressive merging
+    int batchSize = Math.max(numThreads * 2, 4);
     int totalMerged = 0;
     int completedClusters = 0;
 
-    for (Future<ClusterRouteTask> future : futures) {
-      try {
-        ClusterRouteTask result = future.get(120, TimeUnit.SECONDS);
-        if (result == null) continue;
+    for (int batchStart = 0; batchStart < clusters.size(); batchStart += batchSize) {
+      int batchEnd = Math.min(batchStart + batchSize, clusters.size());
 
-        int merged = mergeNewItems(board, result.board, originalItemIds);
-        totalMerged += merged;
-        completedClusters++;
-
-        // Update original item IDs to prevent re-merging in subsequent clusters
-        Set<Integer> updatedIds = new HashSet<>(originalItemIds);
-        Iterator<UndoableObjects.UndoableObjectNode> it = board.item_list.start_read_object();
-        for (;;) {
-          UndoableObjects.Storable ob = board.item_list.read_object(it);
-          if (ob == null) break;
-          if (ob instanceof Item item) {
-            updatedIds.add(item.get_id_no());
-          }
-        }
-        originalItemIds = updatedIds;
-      } catch (TimeoutException e) {
-        future.cancel(true);
-        FRLogger.warn("RegionRouter.clusterRoute: Cluster timed out after 120s.");
-      } catch (Exception e) {
-        FRLogger.warn("RegionRouter.clusterRoute: Cluster execution error: " + e.getMessage());
+      // Check remaining incompletes before launching next batch
+      board.clear_all_item_temporary_autoroute_data();
+      board.finish_autoroute();
+      int remainingNow = new DesignRulesChecker(board, null).getIncompleteCount();
+      if (remainingNow == 0) {
+        FRLogger.info("RegionRouter.clusterRoute: Board fully routed, stopping batch processing.");
+        break;
       }
+
+      FRLogger.info("RegionRouter.clusterRoute: Batch at cluster " + batchStart
+          + " (" + (batchEnd - batchStart) + " clusters), " + remainingNow + " incompletes remaining");
+
+      ExecutorService executor = Executors.newFixedThreadPool(numThreads);
+      // Fix 3: Use CompletionService to merge results as they complete
+      CompletionService<ClusterRouteTask> completionService = new ExecutorCompletionService<>(executor);
+      int submitted = 0;
+
+      for (int ci = batchStart; ci < batchEnd; ci++) {
+        final NetCluster cluster = clusters.get(ci);
+        final int clusterIdx = ci;
+
+        completionService.submit(() -> {
+          long start = System.currentTimeMillis();
+
+          // Deep copy from the CURRENT board state (after previous batch merges)
+          RoutingBoard clusterBoard = board.deepCopy();
+          if (clusterBoard == null) {
+            FRLogger.warn("RegionRouter.clusterRoute: deepCopy failed for cluster " + clusterIdx);
+            return null;
+          }
+
+          // Restrict routing to this cluster's nets only
+          RouterSettings clusterSettings = settings.clone();
+          clusterSettings.netsToRoute = new HashSet<>(cluster.getNetNumbers());
+          clusterSettings.setFanoutEnabled(false);
+
+          StoppableThread ct = createTrialThread();
+          BatchAutorouter router = new BatchAutorouter(ct, clusterBoard, clusterSettings,
+              true, true, settings.get_start_ripup_costs(),
+              settings.trace_pull_tight_accuracy);
+          router.job = createRoutingJob(ct, clusterSettings);
+
+          // Fix 5: Adjust pass limits based on cluster size
+          int netCount = cluster.getNetCount();
+          int passLimit;
+          int stopMinimum;
+          if (netCount <= 3) {
+            passLimit = 3;
+            stopMinimum = 2;
+          } else if (netCount <= 8) {
+            passLimit = 4;
+            stopMinimum = 3;
+          } else {
+            passLimit = 5;
+            stopMinimum = 3;
+          }
+          router.setStagnationPassLimit(passLimit);
+          router.setStopAtPassMinimum(stopMinimum);
+          router.setOptimizerAutorouter(true);
+          router.runBatchLoop();
+
+          int incompletes = new DesignRulesChecker(clusterBoard, null).getIncompleteCount();
+          long duration = System.currentTimeMillis() - start;
+
+          FRLogger.info("RegionRouter.clusterRoute: Cluster " + clusterIdx + " ("
+              + netCount + " nets, passLimit=" + passLimit
+              + ") — " + incompletes + " incompletes, " + duration + "ms");
+
+          return new ClusterRouteTask(clusterBoard, clusterIdx);
+        });
+        submitted++;
+      }
+
+      // Fix 3: Collect results as they complete via CompletionService
+      for (int i = 0; i < submitted; i++) {
+        try {
+          Future<ClusterRouteTask> completed = completionService.take();
+          ClusterRouteTask result = completed.get(120, TimeUnit.SECONDS);
+          if (result == null) continue;
+
+          int merged = mergeNewItems(board, result.board, originalItemIds);
+          totalMerged += merged;
+          completedClusters++;
+
+          // Update original item IDs to prevent re-merging in subsequent clusters
+          Set<Integer> updatedIds = new HashSet<>(originalItemIds);
+          Iterator<UndoableObjects.UndoableObjectNode> it = board.item_list.start_read_object();
+          for (;;) {
+            UndoableObjects.Storable ob = board.item_list.read_object(it);
+            if (ob == null) break;
+            if (ob instanceof Item item) {
+              updatedIds.add(item.get_id_no());
+            }
+          }
+          originalItemIds = updatedIds;
+        } catch (TimeoutException e) {
+          FRLogger.warn("RegionRouter.clusterRoute: Cluster timed out after 120s.");
+        } catch (Exception e) {
+          FRLogger.warn("RegionRouter.clusterRoute: Cluster execution error: " + e.getMessage());
+        }
+      }
+      executor.shutdownNow();
     }
-    executor.shutdownNow();
 
     // Finalize the board after all merges
     board.clear_all_item_temporary_autoroute_data();
@@ -579,13 +668,8 @@ public final class RegionRouter {
       if (originalItemIds.contains(item.get_id_no())) continue;
       if (item instanceof Pin) continue;
       try {
-        ByteArrayOutputStream bos = new ByteArrayOutputStream();
-        ObjectOutputStream oos = new ObjectOutputStream(bos);
-        oos.writeObject(item);
-        oos.flush();
-        ByteArrayInputStream bin = new ByteArrayInputStream(bos.toByteArray());
-        ObjectInputStream ois = new ObjectInputStream(bin);
-        Item copy = (Item) ois.readObject();
+        // Fix 7: Use Item.copy() with auto-generated ID instead of serialization
+        Item copy = item.copy(0);
         copy.board = targetBoard;
         targetBoard.item_list.insert(copy);
         count++;
@@ -684,5 +768,13 @@ public final class RegionRouter {
       this.board = board;
       this.clusterIndex = clusterIndex;
     }
+  }
+
+  /** Creates a minimal RoutingJob for sub-routers (Phase 3/4 runBatchLoop calls). */
+  private static RoutingJob createRoutingJob(StoppableThread thread, RouterSettings settings) {
+    RoutingJob job = new RoutingJob();
+    job.thread = thread;
+    job.routerSettings = settings;
+    return job;
   }
 }

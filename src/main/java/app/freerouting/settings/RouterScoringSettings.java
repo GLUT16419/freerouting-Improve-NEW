@@ -53,6 +53,12 @@ public class RouterScoringSettings implements Serializable, Cloneable {
   // The penalty for an unrouted net.
   @SerializedName("unrouted_net_penalty")
   public Float unroutedNetPenalty;
+  // The penalty for an unrouted power-net connection (lower than signal).
+  @SerializedName("power_net_penalty")
+  public Float powerNetPenalty;
+  // The penalty for an unrouted ground-net connection (zero when fanout is sufficient).
+  @SerializedName("ground_net_penalty")
+  public Float groundNetPenalty;
   // The penalty for a clearance violation.
   @SerializedName("clearance_violation_penalty")
   public Float clearanceViolationPenalty;

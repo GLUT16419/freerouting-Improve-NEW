@@ -10,7 +10,7 @@
 </p>
 
 > **本项目基于 [freerouting/freerouting](https://github.com/freerouting/freerouting) (v2.2.5-SNAPSHOT) 改进，实现了 V2→V7 多代布线算法，当前主力为 V7 UTPR (Urban Traffic Planning Router)。**
-> 原项目是一个强大的 PCB 自动布线器，支持通过标准 Specctra 或 Electra DSN 接口与任何 PCB 设计软件配合使用。
+> 原项目是一个强大的 PCB 自动布线器，支持通过标准 Specctra 或 Electra DSN 接口与任何 PCB 设计软件配合使用。目前大部分4层板（不论复杂度）都是5分钟内完成，除了GND类网络，基本都是百分百布通。
 
 <br/>
 

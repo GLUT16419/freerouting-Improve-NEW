@@ -91,6 +91,13 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
   // Degradation feedback state
   private int degradationRound; // current degradation retry round
 
+  /** Cache for extractNetCellKeys results — avoids redundant pin/trace traversal. */
+  private final Map<Integer, List<Long>> netCellKeyCache = new HashMap<>();
+
+  /** Cached DesignRulesChecker for incremental rebuildRoutedNets. */
+  private DesignRulesChecker cachedDrc;
+  private boolean drcDirty = true;
+
   // ═══════════════════════════════════════════════════════════════════════
   //  Construction
   // ═══════════════════════════════════════════════════════════════════════
@@ -142,6 +149,20 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
     try {
       collectNetNumbers(routingBoard);
 
+      // ── V7.x: Read speedLevel from UI combo box (source of truth) ──
+      {
+        app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel effectiveSpeed =
+            app.freerouting.gui.WindowAutorouteParameter.getActiveSpeedLevel(
+                this.job != null ? this.job.routerSettings : null);
+        if (effectiveSpeed != this.utprSettings.speedLevel) {
+          FRLogger.info("  SpeedLevel synced from UI: " + effectiveSpeed);
+          this.utprSettings.speedLevel = effectiveSpeed;
+        }
+        int netCount = allNetNumbers.size();
+        int layerCount = routingBoard.get_layer_count();
+        utprSettings.applySpeedLevel(netCount, layerCount);
+      }
+
       // ── Phase 0: 城市规划 ──────────────────────────────────────────
       if (utprSettings.phase0Enabled) {
         currentPhase = 0;
@@ -172,6 +193,16 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
       if (utprSettings.phase2Enabled) {
         currentPhase = 2;
         long t2 = System.currentTimeMillis();
+
+        // V7.x: 配置最大空隙优先 and 历史代价冷却
+        if (relaxationManager != null) {
+          relaxationManager.setMaxGapFirstEnabled(utprSettings.maxGapFirstEnabled);
+        }
+        // Apply historical cost decay before D* Lite cycles
+        if (incrementalRerouter != null) {
+          incrementalRerouter.decayHistoricalCosts();
+        }
+
         phase2DistrictRouting(routingBoard);
         // After Phase 2, check length-match degradation
         checkPhase2Degradation(routingBoard);
@@ -305,7 +336,19 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
       FRLogger.info("  [0.2] 概率拥塞估计...");
       congestionEstimator = new ProbabilisticCongestionEstimator(
           routingBoard, utprSettings.congestionCellSizeUm * 100.0);
-      congestionEstimator.estimate(allNetNumbers);
+      // V7.x: Pass length groups for enhanced group-level diffusion
+      Map<Integer, AutomaticNetworkAnalyzer.LengthMatchGroup> lengthGroups = null;
+      if (utprSettings.lengthGroupDiffusionEnabled && networkAnalyzer != null) {
+        try {
+          lengthGroups = networkAnalyzer.getLengthGroups();
+          if (lengthGroups != null && !lengthGroups.isEmpty()) {
+            FRLogger.info("    → 等长组扩散增强: " + lengthGroups.size() + " groups");
+          }
+        } catch (Exception e) {
+          // ignore
+        }
+      }
+      congestionEstimator.estimate(allNetNumbers, lengthGroups);
       FRLogger.info("  [0.3] 主干道走廊规划...");
       corridorPlanner = new MainCorridorPlanner(routingBoard,
           utprSettings.congestionCellSizeUm * 100.0);
@@ -337,6 +380,18 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
           degradationManager = new GracefulDegradationManager(netClassMap);
           degradationManager.setMaxDegradationRounds(utprSettings.maxDegradationRounds);
           degradationManager.buildPlan();
+
+          // V7.x: 预判性降级 — use congestion heatmap to pre-judge diff pairs
+          if (utprSettings.degradationPredictive && congestionEstimator != null) {
+            degradationManager.setDegradationPredictiveEnabled(true);
+            degradationManager.setPredictiveCongestionThresholds(
+                utprSettings.predictiveCongestionThresholdHigh,
+                utprSettings.predictiveCongestionThresholdMid);
+            double[][] heatmap = congestionEstimator.getCongestionMatrix();
+            if (heatmap != null) {
+              degradationManager.buildPredictivePlan(heatmap);
+            }
+          }
         } catch (Exception e) {
           FRLogger.warn("  [0.7] Degradation plan error (continuing): " + e.getMessage());
         }
@@ -380,15 +435,63 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
     FRLogger.info("  [1.4] 时序A*预约式骨干路由...");
     timedAStar = new TimedBidirectionalAStar(routingBoard, routingBoard,
         ch, stom, corridorPlanner, congestionEstimator);
+    // V7.x: 配置拥塞梯度代价与时序软化
+    timedAStar.setCongestionGradientEnabled(utprSettings.congestionGradientEnabled);
+    timedAStar.setCongestionGradientWeight(utprSettings.congestionGradientWeight);
+    timedAStar.setTimeWindowSofteningEnabled(utprSettings.timeWindowSofteningEnabled);
+    timedAStar.setTimeWindowSize(utprSettings.timeWindowSize);
+    timedAStar.setSoftSharingCost(utprSettings.softSharingCost);
+
+    // V7.x: ALT 启发式预计算 (6个地标 — 4角+2中心)
+    try {
+      if (utprSettings.altHeuristicEnabled && ch != null) {
+        timedAStar.precomputeLandmarkDistances(ch);
+        timedAStar.setAltHeuristicEnabled(true);
+        FRLogger.info("  [1.3.ALT] ALT heuristic precomputed with 6 landmarks");
+      }
+    } catch (Exception e) {
+      FRLogger.debug("  [1.3.ALT] ALT precomputation failed: " + e.getMessage());
+    }
+
+    // V7.x: Arc Flags 剪枝预计算
+    try {
+      if (utprSettings.arcFlagsEnabled && ch != null && partitioner != null) {
+        timedAStar.precomputeArcFlags(partitioner, ch);
+        timedAStar.setArcFlagsEnabled(true);
+        FRLogger.info("  [1.3.ArcFlags] Arc Flags precomputed with "
+            + partitioner.getFunctionalBlockCount() + " functional blocks");
+      }
+    } catch (Exception e) {
+      FRLogger.debug("  [1.3.ArcFlags] Arc Flags precomputation failed: " + e.getMessage());
+    }
+
+    // V8: 多目标帕累托 A* — 仅用于关键骨干网络
+    if (utprSettings.paretoAStarEnabled) {
+      timedAStar.setParetoAStarEnabled(true);
+      FRLogger.info("  [V8] Pareto Multi-Objective A* enabled for critical backbone nets");
+    }
+
+    // V7.x: 初始化增量修复器 (含历史代价冷却)
+    try {
+      incrementalRerouter = new IncrementalRerouter(routingBoard, routingBoard,
+          this, stom);
+      incrementalRerouter.setCoolingFactor(utprSettings.dLiteCoolingFactor);
+      incrementalRerouter.setMaxDliteIterations(utprSettings.incrementalMaxIterations);
+    } catch (Exception e) {
+      FRLogger.debug("  [1.4] IncrementalRerouter init failed: " + e.getMessage());
+    }
     // Route backbone nets in priority order — attempt critical + med + low nets.
     // Higher attempt count improves coverage for DRAM/bus nets.
+    // Dynamic MAX_BACKBONE_ROUTE — adapt to board complexity so more nets
+    // get STOM reservation protection before Phase 2.
     int backboneRouted = 0;
     int routeCount = 0;
-    final int MAX_BACKBONE_ROUTE = 60;
+    int netCount = allNetNumbers.size();
+    int maxBackboneRoute = Math.min(netCount, Math.max(60, utprSettings.maxCriticalNets));
     for (BackboneNetSelector.BackboneNet bn : backboneNets) {
       // Skip low-priority nets if already past limit
       if (bn.priority <= BackboneNetSelector.PRIORITY_LOW && routeCount > 24) continue;
-      if (bn.priority <= BackboneNetSelector.PRIORITY_MEDIUM && routeCount >= MAX_BACKBONE_ROUTE) break;
+      if (bn.priority <= BackboneNetSelector.PRIORITY_MEDIUM && routeCount >= maxBackboneRoute) break;
       routeCount++;
       try {
         BatchAutorouter.NetRouteResult result = routeNet(bn.netNo, 8);
@@ -396,8 +499,8 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
           bn.routed = true;
           backboneRouted++;
           routedNets.add(bn.netNo);
-          // Reserve in STOM
-          List<Long> cellKeys = extractNetCellKeys(routingBoard, bn.netNo);
+          // Reserve in STOM (cached cell key extraction)
+          List<Long> cellKeys = extractNetCellKeysCached(routingBoard, bn.netNo);
           if (!cellKeys.isEmpty()) stom.reserve(cellKeys);
         }
       } catch (Exception e) {
@@ -413,6 +516,11 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
   // ═══════════════════════════════════════════════════════════════════════
 
   private void phase2DistrictRouting(RoutingBoard routingBoard) {
+    // V7.x: Log active features
+    if (utprSettings.maxGapFirstEnabled) {
+      FRLogger.info("  [V7.x] 最大空隙优先已启用 — 低要求网络将优先通过大空隙区");
+    }
+
     int remaining = allNetNumbers.size() - routedNets.size();
     FRLogger.info("  [2.1] 全局重生布线 — " + remaining + " 个未完成网络...");
 
@@ -420,9 +528,11 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
     // This clones the board, runs multiple threads with shuffled items,
     // and picks the best result — far more effective than per-net routeNet.
     // Falls back to single-threaded autoroute_pass on exception.
+    int maxPasses = Math.max(0, utprSettings.maxPhase2Passes);
+    int maxRipupTiers = Math.max(0, utprSettings.maxPhase2RipupTiers);
     int beforeCount = routedNets.size();
     try {
-      for (int pass = 1; pass <= 6; pass++) {
+      for (int pass = 1; pass <= maxPasses; pass++) {
         // Multi-threaded pass (fast, clones board for each thread).
         // Falls back to single-thread on exception or zero-progress.
         boolean progress = autoroute_pass_multi_thread(pass);
@@ -451,13 +561,15 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
     }
 
     // After global passes stall, try per-net high-ripup routing on remaining nets.
-    // Two tiers: ripup=30 (moderate), then ripup=50 (aggressive).
+    // Number of tiers controlled by speed level (maxRipupTiers).
     remaining = allNetNumbers.size() - routedNets.size();
-    if (remaining > 0) {
+    if (remaining > 0 && maxRipupTiers > 0) {
       FRLogger.info("  [2.2] 高撕线代价逐网攻克 — " + remaining + " 个顽固网络...");
       int highRipupRouted = 0;
       int[] ripupTiers = {30, 50};
-      for (int tier : ripupTiers) {
+      int tierLimit = Math.min(maxRipupTiers, ripupTiers.length);
+      for (int ti = 0; ti < tierLimit; ti++) {
+        int tier = ripupTiers[ti];
         int tierRouted = 0;
         for (int netNo : allNetNumbers) {
           if (routedNets.contains(netNo)) continue;
@@ -491,13 +603,20 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
       FRLogger.info("  Phase 3: no remaining nets — all routed");
       return;
     }
-    FRLogger.info("  [3.1] 最终清理 — " + remaining.size() + " 个未完成...");
+    int maxP3 = Math.max(0, utprSettings.maxPhase3Passes);
+    FRLogger.info("  [3.1] 最终清理 — " + remaining.size() + " 个未完成 (Phase3 passes=" + maxP3 + ")...");
+
+    if (maxP3 <= 0) {
+      // Speed tier skips Phase 3 — mark remaining as failed directly
+      failedNets.addAll(remaining);
+      return;
+    }
 
     int before = routedNets.size();
     try {
       // Continue autoroute passes with higher pass numbers (higher ripup).
       // Falls back to single-thread on exception or zero-progress.
-      for (int pass = 5; pass <= 10; pass++) {
+      for (int pass = 5; pass < 5 + maxP3; pass++) {
         boolean progress = autoroute_pass_multi_thread(pass);
         if (!progress) {
           try {
@@ -669,6 +788,16 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
     }
   }
 
+  /** Cached version of extractNetCellKeys — avoids redundant pin traversal. */
+  private List<Long> extractNetCellKeysCached(RoutingBoard board, int netNo) {
+    return netCellKeyCache.computeIfAbsent(netNo, n -> extractNetCellKeys(board, n));
+  }
+
+  /** Clear the net cell key cache (e.g. after ripup/reroute changes). */
+  public void clearNetCellKeyCache() {
+    netCellKeyCache.clear();
+  }
+
   private List<Long> extractNetCellKeys(RoutingBoard board, int netNo) {
     app.freerouting.rules.Net net = board.rules.nets.get(netNo);
     if (net == null || stom == null) return Collections.emptyList();
@@ -692,25 +821,30 @@ public class UrbanTrafficBatchAutorouter extends BatchAutorouter {
   }
 
   /**
-   * Rebuild the routedNets set by checking each net's actual incomplete
-   * connection count via DesignRulesChecker. This ensures routedNets
-   * reflects the true board state after autoroute_pass_multi_thread.
+   * Rebuild the routedNets set using cached DesignRulesChecker.
+   * Avoids re-creating DRC on every pass — only recalculates when drcDirty is true.
    */
   private void rebuildRoutedNets() {
     if (!(this.board instanceof RoutingBoard)) return;
     RoutingBoard rb = (RoutingBoard) this.board;
-    DesignRulesChecker drc = new DesignRulesChecker(rb, null);
-    drc.calculateAllIncompletes();
+    if (cachedDrc == null || drcDirty) {
+      cachedDrc = new DesignRulesChecker(rb, null);
+      drcDirty = false;
+    }
+    cachedDrc.calculateAllIncompletes();
 
     Set<Integer> newRouted = new HashSet<>();
     for (int netNo : allNetNumbers) {
-      if (drc.getIncompleteCount(netNo) == 0) {
+      if (cachedDrc.getIncompleteCount(netNo) == 0) {
         newRouted.add(netNo);
       }
     }
     routedNets.clear();
     routedNets.addAll(newRouted);
   }
+
+  /** Mark DRC cache dirty when board changes (e.g. after per-net routing). */
+  public void markDrcDirty() { this.drcDirty = true; }
 
   /** Get current pipeline phase number. */
   public int getCurrentPhase() { return currentPhase; }

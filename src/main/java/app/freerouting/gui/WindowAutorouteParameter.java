@@ -4,6 +4,7 @@ import app.freerouting.board.Layer;
 import app.freerouting.board.LayerStructure;
 import app.freerouting.interactive.GuiBoardManager;
 import app.freerouting.util.TextManager;
+import app.freerouting.logger.FRLogger;
 import app.freerouting.management.analytics.FRAnalytics;
 import app.freerouting.settings.RouterSettings;
 import java.awt.Color;
@@ -67,6 +68,13 @@ public class WindowAutorouteParameter extends BoardSavableSubWindow {
   private final String algorithm_v19;
   private final String algorithm_hybrid;
   private final String algorithm_utpr;
+
+  // ── V7.x 速度档位 ──
+  private final JComboBox<String> speed_level_combo_box;
+  private final String speed_very_fast;
+  private final String speed_fast;
+  private final String speed_medium;
+  private final String speed_slow;
   private final JFormattedTextField[] preferred_direction_trace_cost_arr;
   private final JFormattedTextField[] against_preferred_direction_trace_cost_arr;
   private final JFormattedTextField[] bend_cost_arr;
@@ -80,6 +88,9 @@ public class WindowAutorouteParameter extends BoardSavableSubWindow {
   private boolean max_threads_input_completed = true;
   // Flag to prevent circular updates between GUI and settings
   private boolean isUpdatingFromSettings = false;
+
+  /** Keep a static reference so the pipeline can read the speed combo box. */
+  private static WindowAutorouteParameter activeInstance = null;
 
   /**
    * Creates a new instance of WindowAutorouteParameter
@@ -410,6 +421,29 @@ public class WindowAutorouteParameter extends BoardSavableSubWindow {
     gridbag.setConstraints(settings_autorouter_algorithm_combo_box, gridbag_constraints);
     main_panel.add(settings_autorouter_algorithm_combo_box);
 
+    // ── V7.x: 速度档位选择 ──
+    this.speed_very_fast = tm.getText("speed_very_fast");
+    this.speed_fast = tm.getText("speed_fast");
+    this.speed_medium = tm.getText("speed_medium");
+    this.speed_slow = tm.getText("speed_slow");
+    speed_level_combo_box = new JComboBox<>();
+    speed_level_combo_box.addItem(this.speed_very_fast);
+    speed_level_combo_box.addItem(this.speed_fast);
+    speed_level_combo_box.addItem(this.speed_medium);
+    speed_level_combo_box.addItem(this.speed_slow);
+    speed_level_combo_box.setToolTipText(tm.getText("speed_level_tooltip"));
+    // Listener added after refresh() to avoid init-time firing
+
+    gridbag_constraints.gridwidth = 2;
+    JLabel speed_label = new JLabel();
+    tm.setText(speed_label, "speed_level");
+    gridbag.setConstraints(speed_label, gridbag_constraints);
+    main_panel.add(speed_label);
+
+    gridbag_constraints.gridwidth = GridBagConstraints.REMAINDER;
+    gridbag.setConstraints(speed_level_combo_box, gridbag_constraints);
+    main_panel.add(speed_level_combo_box);
+
     JLabel separator2 = new JLabel("––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––––  ");
     gridbag_constraints.gridwidth = GridBagConstraints.REMAINDER;
     gridbag_constraints.fill = GridBagConstraints.HORIZONTAL;
@@ -499,8 +533,47 @@ public class WindowAutorouteParameter extends BoardSavableSubWindow {
     this.pack();
     this.setResizable(false);
 
+    // Register speed level listeners AFTER refresh to avoid init-time firing
+    speed_level_combo_box.addActionListener(new SpeedLevelListener());
+    speed_level_combo_box.addActionListener(
+        _ -> FRAnalytics.buttonClicked("speed_level_combo_box",
+            speed_level_combo_box.getSelectedItem().toString()));
+
     // Register as listener for settings changes (bidirectional binding)
     this.board_handling.getCurrentRoutingJob().routerSettings.addPropertyChangeListener(this::onSettingsChanged);
+
+    // Store as active instance for pipeline access
+    activeInstance = this;
+  }
+
+  /** Get the active WindowAutorouteParameter instance (null if window closed). */
+  public static WindowAutorouteParameter getActiveInstance() { return activeInstance; }
+
+  /**
+   * Read the current speed level from the speed combo box (UI source of truth).
+   * Falls back to RouterSettings.utpr.speedLevel if no UI is active.
+   */
+  public static app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel getActiveSpeedLevel(
+      app.freerouting.settings.RouterSettings routerSettings) {
+    // In GUI mode: read from combo box
+    if (activeInstance != null && activeInstance.speed_level_combo_box != null) {
+      Object selected = activeInstance.speed_level_combo_box.getSelectedItem();
+      if (selected == activeInstance.speed_very_fast) {
+        return app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel.VERY_FAST;
+      }
+      if (selected == activeInstance.speed_fast) {
+        return app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel.FAST;
+      }
+      if (selected == activeInstance.speed_slow) {
+        return app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel.SLOW;
+      }
+      return app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel.MEDIUM;
+    }
+    // Headless mode: use setting
+    if (routerSettings != null && routerSettings.utpr != null) {
+      return routerSettings.utpr.speedLevel;
+    }
+    return app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel.MEDIUM;
   }
 
   static int normalizeIntInput(Object input, int oldValue, int minValue, int maxValue) {
@@ -685,6 +758,21 @@ public class WindowAutorouteParameter extends BoardSavableSubWindow {
       this.settings_autorouter_algorithm_combo_box.setSelectedItem(this.algorithm_hybrid);
     } else {
       this.settings_autorouter_algorithm_combo_box.setSelectedItem(this.algorithm_current);
+    }
+
+    // V7.x: Set speed level (wrap in isUpdatingFromSettings to prevent listener re-entry)
+    if (settings.utpr != null) {
+      isUpdatingFromSettings = true;
+      try {
+        switch (settings.utpr.speedLevel) {
+          case VERY_FAST: this.speed_level_combo_box.setSelectedItem(this.speed_very_fast); break;
+          case FAST:      this.speed_level_combo_box.setSelectedItem(this.speed_fast); break;
+          case MEDIUM:    this.speed_level_combo_box.setSelectedItem(this.speed_medium); break;
+          case SLOW:      this.speed_level_combo_box.setSelectedItem(this.speed_slow); break;
+        }
+      } finally {
+        isUpdatingFromSettings = false;
+      }
     }
   }
 
@@ -1268,6 +1356,25 @@ public class WindowAutorouteParameter extends BoardSavableSubWindow {
         }
       }
     }
+  }
+
+  /** V7.x: Speed level listener — logs changes only (actual sync happens in pipeline). */
+  private class SpeedLevelListener implements ActionListener {
+    @Override
+    public void actionPerformed(ActionEvent p_evt) {
+      Object selected = speed_level_combo_box.getSelectedItem();
+      String levelName = selected != null ? selected.toString() : "UNKNOWN";
+      FRLogger.info("  SpeedLevel combo changed to: " + levelName);
+    }
+  }
+
+  /** Read the current speed level from the combo box selection. */
+  public app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel getSpeedFromUI() {
+    Object selected = speed_level_combo_box.getSelectedItem();
+    if (selected == speed_very_fast) return app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel.VERY_FAST;
+    if (selected == speed_fast) return app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel.FAST;
+    if (selected == speed_slow) return app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel.SLOW;
+    return app.freerouting.autoroute.UrbanTrafficRouterSettings.SpeedLevel.MEDIUM;
   }
 
   private class PreferredDirectionTraceCostKeyListener extends KeyAdapter {

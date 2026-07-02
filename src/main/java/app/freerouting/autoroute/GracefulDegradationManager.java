@@ -32,6 +32,14 @@ public class GracefulDegradationManager implements Serializable {
   private int maxDegradationRounds = 5;
   private boolean degradationEnabled = true;
 
+  // ── 预判性降级参数 (V7.x) ──
+  private boolean degradationPredictiveEnabled = false;
+  private double predictiveCongestionThresholdHigh = 0.85;
+  private double predictiveCongestionThresholdMid = 0.70;
+
+  /** Nets with reduced Phase 1 timeout (pre-judged mid-conflict). */
+  private final Set<Integer> reducedTimeoutNets = new HashSet<>();
+
   // ═══════════════════════════════════════════════════════════════════════
   //  Construction
   // ═══════════════════════════════════════════════════════════════════════
@@ -83,6 +91,110 @@ public class GracefulDegradationManager implements Serializable {
         .filter(l -> l == NetClass.DegradationLevel.LEVEL_1).count();
     FRLogger.info("GracefulDegradationManager: " + netDegradationMap.size()
         + " nets tracked (LEVEL_0=" + level0 + ", LEVEL_1=" + level1 + ")");
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  预判性降级 (V7.x) — Predictive Degradation
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Build a predictive degradation plan based on probabilistic congestion heatmap.
+   * <p>
+   * Called at the end of Phase 0, after congestion estimation is complete.
+   * Pre-judges which diff pairs / length-match groups are likely to fail
+   * due to high congestion in their mandatory routing region.
+   * <p>
+   * Rules:
+   * <ul>
+   *   <li>weightedCongestion &gt; high threshold → start at LEVEL_1</li>
+   *   <li>weightedCongestion &gt; mid threshold → Phase 1 timeout halved</li>
+   *   <li>otherwise → normal start</li>
+   * </ul>
+   *
+   * @param congestion 2D congestion heatmap [row][col] in [0..1]
+   */
+  public void buildPredictivePlan(double[][] congestion) {
+    if (!degradationPredictiveEnabled || congestion == null) return;
+
+    int preDegraded = 0;
+    int preTimedOut = 0;
+
+    for (Map.Entry<Integer, NetClass> entry : netClassMap.entrySet()) {
+      int netNo = entry.getKey();
+      NetClass nc = entry.getValue();
+
+      // Only predict for diff pairs and length-match groups
+      if (!nc.isPartOfDiffPair() && !nc.isPartOfLengthGroup()) continue;
+
+      // Estimate the mandatory routing region of this net
+      double weightedCongestion = estimateRouteCongestion(netNo, nc, congestion);
+
+      if (weightedCongestion > predictiveCongestionThresholdHigh) {
+        // High conflict → skip LEVEL_0, start at LEVEL_1
+        NetClass.DegradationLevel current = netDegradationMap.getOrDefault(netNo,
+            NetClass.DegradationLevel.LEVEL_0);
+        if (current == NetClass.DegradationLevel.LEVEL_0) {
+          netDegradationMap.put(netNo, NetClass.DegradationLevel.LEVEL_1);
+          nc.setDegradationLevel(NetClass.DegradationLevel.LEVEL_1);
+          preDegraded++;
+          String reason = String.format("预判降级: 拥塞指数 %.2f > %.2f",
+              weightedCongestion, predictiveCongestionThresholdHigh);
+          DegradationEvent event = new DegradationEvent(netNo, nc.getLengthGroupId(),
+              NetClass.DegradationLevel.LEVEL_0, NetClass.DegradationLevel.LEVEL_1,
+              reason, 0, true);
+          eventLog.add(event);
+          event.log();
+        }
+      } else if (weightedCongestion > predictiveCongestionThresholdMid) {
+        // Medium conflict → mark for reduced Phase 1 timeout
+        preTimedOut++;
+        reducedTimeoutNets.add(netNo);
+      }
+    }
+
+    if (preDegraded > 0 || preTimedOut > 0) {
+      FRLogger.info("  GracefulDegradationManager: 预判降级 " + preDegraded
+          + " 网络 (直接降级), " + preTimedOut + " 网络 (超时减半)");
+    }
+  }
+
+  /**
+   * Estimate the weighted congestion in a net's mandatory routing region.
+   * Uses the bounding box of the net's pins, weighted by a Gaussian-like
+   * kernel centered on the pin cluster.
+   */
+  private double estimateRouteCongestion(int netNo, NetClass nc,
+                                          double[][] congestion) {
+    // Use pin bounding box as the routing region
+    if (congestion == null || congestion.length == 0) return 0.0;
+
+    int gridRows = congestion.length;
+    int gridCols = congestion[0].length;
+
+    // Simple approach: average congestion in the net's bounding box
+    // with higher weight on the center region
+    double totalWeight = 0;
+    double weightedSum = 0;
+
+    // Center of the bounding box (assumed pin cluster center)
+    int centerR = gridRows / 2;
+    int centerC = gridCols / 2;
+
+    int radiusR = Math.max(1, gridRows / 4);
+    int radiusC = Math.max(1, gridCols / 4);
+
+    for (int r = Math.max(0, centerR - radiusR); r <= Math.min(gridRows - 1, centerR + radiusR); r++) {
+      for (int c = Math.max(0, centerC - radiusC); c <= Math.min(gridCols - 1, centerC + radiusC); c++) {
+        // Gaussian-like weight: higher near center
+        double dr = (double) (r - centerR) / radiusR;
+        double dc = (double) (c - centerC) / radiusC;
+        double w = Math.exp(-(dr * dr + dc * dc) * 2.0);
+        weightedSum += congestion[r][c] * w;
+        totalWeight += w;
+      }
+    }
+
+    return totalWeight > 1e-10 ? weightedSum / totalWeight : 0.0;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -400,6 +512,23 @@ public class GracefulDegradationManager implements Serializable {
   public void setDegradationEnabled(boolean enabled) { this.degradationEnabled = enabled; }
 
   public boolean isDegradationEnabled() { return degradationEnabled; }
+
+  /** Check if a net has reduced Phase 1 timeout (from predictive degradation). */
+  public boolean hasReducedTimeout(int netNo) {
+    return reducedTimeoutNets.contains(netNo);
+  }
+
+  /** Enable/disable predictive degradation (V7.x). */
+  public void setDegradationPredictiveEnabled(boolean enabled) {
+    this.degradationPredictiveEnabled = enabled;
+  }
+
+  public boolean isDegradationPredictiveEnabled() { return degradationPredictiveEnabled; }
+
+  public void setPredictiveCongestionThresholds(double high, double mid) {
+    this.predictiveCongestionThresholdHigh = high;
+    this.predictiveCongestionThresholdMid = mid;
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   //  Helpers

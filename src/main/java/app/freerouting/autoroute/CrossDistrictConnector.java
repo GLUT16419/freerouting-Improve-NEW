@@ -56,6 +56,19 @@ public class CrossDistrictConnector implements Serializable {
 
   /** District adjacency graph: district ID -> set of adjacent district IDs. */
   private Map<Integer, Set<Integer>> districtAdjacency;
+  private boolean adjacencyBuilt = false;
+
+  /** Cache: boundary point ID -> FloatPoint (avoids linear scan). */
+  private final Map<Integer, FloatPoint> bpCoordCache = new HashMap<>();
+
+  /** Cache: boundary pair (districtA, districtB) -> best pair IDs (avoids O(N*M) per net). */
+  private final Map<String, int[]> boundaryPairCache = new HashMap<>();
+
+  /** Cache: net cell keys (netNumber -> cell keys) to avoid redundant trace/pin traversal. */
+  private final Map<Integer, List<Long>> netCellKeyCache = new HashMap<>();
+
+  /** Cache: all net numbers (computed once). */
+  private Set<Integer> allNetNumbersCached = null;
 
   // ═══════════════════════════════════════════════════════════════════════
   //  Construction
@@ -101,8 +114,12 @@ public class CrossDistrictConnector implements Serializable {
     FRLogger.info("CrossDistrictConnector: connecting " + allRemaining.size()
         + " cross-district nets (4-step flow)");
 
-    // Step 0: Build district adjacency graph
-    buildDistrictAdjacency();
+    // Step 0: Build district adjacency graph once (cached for subsequent calls)
+    if (!adjacencyBuilt) {
+      buildDistrictAdjacency();
+      adjacencyBuilt = true;
+      precomputeBoundaryPairCache();
+    }
 
     for (int netNo : allRemaining) {
       try {
@@ -135,18 +152,29 @@ public class CrossDistrictConnector implements Serializable {
     Set<Integer> crossDistrict = new HashSet<>();
     if (partitioner == null) return crossDistrict;
 
-    // Build pin -> district map once
+    // Build pin -> district map once (used across nets for cache efficiency)
     Map<Integer, Integer> pinDistrictCache = new HashMap<>();
+    int cacheHits = 0;
 
-    for (int netNo : getAllNetNumbers()) {
+    for (int netNo : getAllNetNumbersCached()) {
       Net net = board.rules.nets.get(netNo);
       if (net == null || net.get_pins().size() < 2) continue;
 
       Set<Integer> involvedDistricts = new HashSet<>();
       for (Pin pin : net.get_pins()) {
-        FloatPoint c = pin.get_center().to_float();
-        // Check which district this pin belongs to
-        int districtId = findDistrictForPoint(c.x, c.y);
+        int pinHash = pin.hashCode();
+        Integer cachedId = pinDistrictCache.get(pinHash);
+        int districtId;
+        if (cachedId != null) {
+          districtId = cachedId;
+          cacheHits++;
+        } else {
+          FloatPoint c = pin.get_center().to_float();
+          districtId = findDistrictForPoint(c.x, c.y);
+          if (districtId >= 0) {
+            pinDistrictCache.put(pinHash, districtId);
+          }
+        }
         if (districtId >= 0) {
           involvedDistricts.add(districtId);
         }
@@ -159,7 +187,7 @@ public class CrossDistrictConnector implements Serializable {
     }
 
     FRLogger.info("CrossDistrictConnector (Step 1): identified "
-        + crossDistrict.size() + " cross-district nets");
+        + crossDistrict.size() + " cross-district nets (pin cache hits=" + cacheHits + ")");
     return crossDistrict;
   }
 
@@ -225,34 +253,9 @@ public class CrossDistrictConnector implements Serializable {
    * Uses the precomputed DistrictBoundaryPathTable.
    */
   private int[] matchBoundaryPoints(int districtA, int districtB) {
-    if (boundaryPathTable == null) return null;
-
-    MultiLevelPartitioner.District dA = partitioner.getDistrict(districtA);
-    MultiLevelPartitioner.District dB = partitioner.getDistrict(districtB);
-    if (dA == null || dB == null) return null;
-
-    // Iterate over boundary points of district A and find the closest
-    // boundary point of district B
-    double bestDist = Double.MAX_VALUE;
-    int bestBP_A = -1, bestBP_B = -1;
-
-    for (MultiLevelPartitioner.BoundaryPoint bpA : dA.boundaryPoints) {
-      for (MultiLevelPartitioner.BoundaryPoint bpB : dB.boundaryPoints) {
-        double dx = bpA.x - bpB.x;
-        double dy = bpA.y - bpB.y;
-        double dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < bestDist) {
-          bestDist = dist;
-          bestBP_A = bpA.id;
-          bestBP_B = bpB.id;
-        }
-      }
-    }
-
-    if (bestBP_A >= 0 && bestBP_B >= 0) {
-      return new int[]{bestBP_A, bestBP_B};
-    }
-    return null;
+    // Use precomputed cache — O(1) instead of O(N*M)
+    String key = districtA + "->" + districtB;
+    return boundaryPairCache.get(key);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -304,7 +307,7 @@ public class CrossDistrictConnector implements Serializable {
         BatchAutorouter.NetRouteResult resultA =
             batchAutorouter.routeNet(netNo, 5);
         if (resultA != null && resultA.isRouted()) {
-          List<Long> cellKeys = extractNetCellKeys(net);
+          List<Long> cellKeys = extractNetCellKeysCached(net);
           allPathCells.addAll(cellKeys);
           if (stom != null) {
             stom.reserve(cellKeys);
@@ -389,14 +392,58 @@ public class CrossDistrictConnector implements Serializable {
   }
 
   private FloatPoint getBPCoord(int bpId) {
-    for (MultiLevelPartitioner.District d : partitioner.getAllDistricts()) {
-      for (MultiLevelPartitioner.BoundaryPoint bp : d.boundaryPoints) {
-        if (bp.id == bpId) {
-          return new FloatPoint((float) bp.x, (float) bp.y);
+    // Use cache to avoid linear scan through all districts/boundary points
+    if (bpCoordCache.isEmpty()) {
+      // Build cache once
+      for (MultiLevelPartitioner.District d : partitioner.getAllDistricts()) {
+        for (MultiLevelPartitioner.BoundaryPoint bp : d.boundaryPoints) {
+          bpCoordCache.put(bp.id, new FloatPoint((float) bp.x, (float) bp.y));
         }
       }
     }
-    return null;
+    return bpCoordCache.get(bpId);
+  }
+
+  /**
+   * Precompute nearest boundary-point pairs for all adjacent district pairs.
+   * This replaces the O(N*M) per-net matching with a O(1) cache lookup.
+   */
+  private void precomputeBoundaryPairCache() {
+    boundaryPairCache.clear();
+    for (Map.Entry<Integer, Set<Integer>> entry : districtAdjacency.entrySet()) {
+      int dA = entry.getKey();
+      for (int dB : entry.getValue()) {
+        String key = dA + "->" + dB;
+        int[] bestPair = computeBestBoundaryPair(dA, dB);
+        if (bestPair != null) {
+          boundaryPairCache.put(key, bestPair);
+        }
+      }
+    }
+    FRLogger.info("CrossDistrictConnector: precomputed " + boundaryPairCache.size()
+        + " boundary pairs for " + districtAdjacency.size() + " districts");
+  }
+
+  /** Compute the nearest boundary point pair between two districts (O(N*M) once). */
+  private int[] computeBestBoundaryPair(int districtA, int districtB) {
+    MultiLevelPartitioner.District dA = partitioner.getDistrict(districtA);
+    MultiLevelPartitioner.District dB = partitioner.getDistrict(districtB);
+    if (dA == null || dB == null) return null;
+    double bestDist = Double.MAX_VALUE;
+    int bestBP_A = -1, bestBP_B = -1;
+    for (MultiLevelPartitioner.BoundaryPoint bpA : dA.boundaryPoints) {
+      for (MultiLevelPartitioner.BoundaryPoint bpB : dB.boundaryPoints) {
+        double dx = bpA.x - bpB.x;
+        double dy = bpA.y - bpB.y;
+        double dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestBP_A = bpA.id;
+          bestBP_B = bpB.id;
+        }
+      }
+    }
+    return (bestBP_A >= 0 && bestBP_B >= 0) ? new int[]{bestBP_A, bestBP_B} : null;
   }
 
   private boolean fallbackRoute(int netNo) {
@@ -404,7 +451,7 @@ public class CrossDistrictConnector implements Serializable {
       BatchAutorouter.NetRouteResult result = batchAutorouter.routeNet(netNo, 15);
       if (result != null && result.isRouted()) {
         if (stom != null) {
-          List<Long> cellKeys = extractNetCellKeys(board.rules.nets.get(netNo));
+          List<Long> cellKeys = extractNetCellKeysCached(board.rules.nets.get(netNo));
           if (!cellKeys.isEmpty()) {
             stom.reserve(cellKeys);
           }
@@ -418,16 +465,24 @@ public class CrossDistrictConnector implements Serializable {
     return false;
   }
 
-  private Set<Integer> getAllNetNumbers() {
-    Set<Integer> result = new HashSet<>();
-    int maxNetNo = board.rules.nets.max_net_no();
-    for (int i = 1; i <= maxNetNo; i++) {
-      Net net = board.rules.nets.get(i);
-      if (net != null && net.get_pins().size() >= 2) {
-        result.add(i);
+  private Set<Integer> getAllNetNumbersCached() {
+    if (allNetNumbersCached == null) {
+      allNetNumbersCached = new HashSet<>();
+      int maxNetNo = board.rules.nets.max_net_no();
+      for (int i = 1; i <= maxNetNo; i++) {
+        Net net = board.rules.nets.get(i);
+        if (net != null && net.get_pins().size() >= 2) {
+          allNetNumbersCached.add(i);
+        }
       }
     }
-    return result;
+    return allNetNumbersCached;
+  }
+
+  /** Cached version of extractNetCellKeys. */
+  private List<Long> extractNetCellKeysCached(Net net) {
+    if (net == null) return Collections.emptyList();
+    return netCellKeyCache.computeIfAbsent(net.net_number, k -> extractNetCellKeys(net));
   }
 
   private List<Long> extractNetCellKeys(Net net) {

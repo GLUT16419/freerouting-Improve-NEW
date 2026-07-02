@@ -386,20 +386,24 @@ public class BottleneckSatSolver implements Serializable {
           selected.values().stream().mapToDouble(p -> p.totalCost).sum(), 0, selected);
     }
 
-    // Build the SAT solver (reuse Sat4jSolver for core algorithm)
-    Sat4jSolver satSolver = new Sat4jSolver(board);
-    satSolver.detectDifferentialPairs(new HashSet<>(solvableNets));
+    // Build the base SAT solver once — reuses diff pair detection across variants
+    Sat4jSolver baseSatSolver = new Sat4jSolver(board);
+    baseSatSolver.detectDifferentialPairs(new HashSet<>(solvableNets));
 
-    // Convert candidates to Sat4jSolver format
+    // Convert candidates once and reuse across solver variants
     for (int netNo : solvableNets) {
       List<CandidatePath> ourPaths = candidates.get(netNo);
       List<Sat4jSolver.CandidatePath> satPaths = ourPaths.stream()
           .map(CandidatePath::toSat4jPath)
           .collect(Collectors.toList());
-      satSolver.addCandidates(netNo, satPaths);
+      baseSatSolver.addCandidates(netNo, satPaths);
     }
-
-    satSolver.buildConflictGraph();
+    baseSatSolver.buildConflictGraph();
+    // Pre-serialize candidate data for fast variant cloning
+    Map<Integer, List<Sat4jSolver.CandidatePath>> sharedCandidates = new HashMap<>();
+    for (int netNo : solvableNets) {
+      sharedCandidates.put(netNo, baseSatSolver.getCandidates(netNo));
+    }
 
     // Parallel solve using multiple relaxation levels
     ExecutorService executor = Executors.newFixedThreadPool(
@@ -409,15 +413,13 @@ public class BottleneckSatSolver implements Serializable {
     Set<Integer> allNetSet = new HashSet<>(solvableNets);
 
     for (int variant = 0; variant < PARALLEL_SOLVER_COUNT; variant++) {
-      final int relLevel = variant; // different relaxation per variant
+      final int relLevel = variant;
       futures.add(executor.submit(() -> {
-        // Use Sat4jSolver's greedy solve
-        Sat4jSolver variantSolver = new Sat4jSolver(satSolver);
-        // Re-detect diff pairs since clone loses them
-        variantSolver.detectDifferentialPairs(allNetSet);
-        // Re-add candidates
+        // Clone solver from base — avoids re-detecting diff pairs
+        Sat4jSolver variantSolver = new Sat4jSolver(baseSatSolver);
+        // Re-add candidates (shared data, different instances)
         for (int n : solvableNets) {
-          variantSolver.addCandidates(n, satSolver.getCandidates(n));
+          variantSolver.addCandidates(n, sharedCandidates.get(n));
         }
         variantSolver.buildConflictGraph();
         Set<Integer> solved = variantSolver.solve(allNetSet, relLevel);
@@ -538,12 +540,12 @@ public class BottleneckSatSolver implements Serializable {
    * Estimate path length for a net from its pin bounding box.
    */
   private double estimatePathLength(Net net) {
-    double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE;
-    double maxX = -Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
+    double minX = Double.POSITIVE_INFINITY, minY = Double.POSITIVE_INFINITY;
+    double maxX = Double.NEGATIVE_INFINITY, maxY = Double.NEGATIVE_INFINITY;
     for (Pin pin : net.get_pins()) {
       FloatPoint c = pin.get_center().to_float();
-      minX = Math.min(minX, c.x); maxX = Math.max(maxX, c.x);
-      minY = Math.min(minY, c.y); maxY = Math.max(maxY, c.y);
+      if (c.x < minX) minX = c.x; if (c.x > maxX) maxX = c.x;
+      if (c.y < minY) minY = c.y; if (c.y > maxY) maxY = c.y;
     }
     return (maxX - minX) + (maxY - minY); // Manhattan
   }

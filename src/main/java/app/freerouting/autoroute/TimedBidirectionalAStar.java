@@ -67,6 +67,13 @@ public class TimedBidirectionalAStar implements Serializable {
   /** Minimum serpentine amplitude for length matching (grid cells). */
   static final double MIN_SERPENTINE_AMP = 2.0;
 
+  // ── V7.x: 拥塞梯度代价 ──
+  static final double CONGESTION_GRADIENT_WEIGHT = 5.0;
+
+  // ── V7.x: 时间窗软化 ──
+  static final int TIME_WINDOW_SIZE = 3;
+  static final double SOFT_SHARING_COST = 10.0;
+
   // ═══════════════════════════════════════════════════════════════════════
   //  SearchNode
   // ═══════════════════════════════════════════════════════════════════════
@@ -155,6 +162,60 @@ public class TimedBidirectionalAStar implements Serializable {
   private final int gridCols, gridRows;
   private final int layerCount;
   private final int[] signalLayers;
+
+  // ── V7.x runtime flags (injected from settings) ──
+  private boolean congestionGradientEnabled = false;
+  private double congestionGradientWeight = CONGESTION_GRADIENT_WEIGHT;
+  private boolean timeWindowSofteningEnabled = false;
+  private int timeWindowSize = TIME_WINDOW_SIZE;
+  private double softSharingCost = SOFT_SHARING_COST;
+
+  // ── ALT heuristic (A* with Landmarks + Triangle inequality) ──
+  /** landmarkDistances[l][cellIdx] = shortest dist from landmark l to grid cell. */
+  private double[][] landmarkDistances;
+  /** Number of landmarks (0 = ALT disabled). */
+  private int numLandmarks = 0;
+  private boolean altHeuristicEnabled = false;
+
+  // ── Arc Flags pruning ──
+  /** arcFlags[cellIdx] = BitSet of functional block IDs reachable from this cell. */
+  private BitSet[] arcFlags;
+  /** cellFunctionalBlockIds[cellIdx] = functional block ID for each grid cell. */
+  private int[] cellFunctionalBlockIds;
+  private boolean arcFlagsEnabled = false;
+  /** Number of functional blocks (for flag validation). */
+  private int numFunctionalBlocks = 0;
+
+  // ── V8: 多目标帕累托 A\* (Multi-Objective Pareto A*) ──
+  private boolean paretoAStarEnabled = false;
+
+  static class ParetoLabel {
+    final double length;
+    final double congestion;
+    final long cellKey;
+    ParetoLabel(double length, double congestion, long cellKey) {
+      this.length = length; this.congestion = congestion; this.cellKey = cellKey;
+    }
+    boolean dominates(ParetoLabel o) {
+      return length <= o.length && congestion <= o.congestion
+          && (length < o.length || congestion < o.congestion);
+    }
+  }
+
+  static class ParetoFront {
+    final List<ParetoLabel> labels = new ArrayList<>();
+    boolean tryAdd(ParetoLabel nl) {
+      labels.removeIf(l -> nl.dominates(l));
+      for (ParetoLabel l : labels) if (l.dominates(nl)) return false;
+      labels.add(nl); return true;
+    }
+    ParetoLabel getMinCongestion() {
+      ParetoLabel b = null;
+      for (ParetoLabel l : labels) if (b == null || l.congestion < b.congestion) b = l;
+      return b;
+    }
+    int size() { return labels.size(); }
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   //  Construction
@@ -253,8 +314,8 @@ public class TimedBidirectionalAStar implements Serializable {
     Map<Long, SearchNode> parentFwd = new HashMap<>();
     Map<Long, SearchNode> parentBwd = new HashMap<>();
 
-    // ── Heuristic ──
-    double h0 = manhattan(srcRow, srcCol, tgtRow, tgtCol) * HEURISTIC_WEIGHT;
+    // ── Heuristic (ALT or Manhattan) ──
+    double h0 = heuristicALT(srcRow, srcCol, tgtRow, tgtCol);
 
     SearchNode startNode = new SearchNode(srcRow, srcCol, layer, 0, h0, null, true);
     openFwd.add(startNode);
@@ -269,6 +330,20 @@ public class TimedBidirectionalAStar implements Serializable {
     double bestPathCost = Double.MAX_VALUE;
     long meetingKey = -1L;
     int nodesExpanded = 0;
+
+    // ── Compute source/target functional block IDs for Arc Flags pruning ──
+    int srcFunctionalBlockId = -1;
+    int targetFunctionalBlockId = -1;
+    if (arcFlagsEnabled && cellFunctionalBlockIds != null) {
+      int srcIdx = srcRow * gridCols + srcCol;
+      if (srcIdx >= 0 && srcIdx < cellFunctionalBlockIds.length) {
+        srcFunctionalBlockId = cellFunctionalBlockIds[srcIdx];
+      }
+      int tgtIdx = tgtRow * gridCols + tgtCol;
+      if (tgtIdx >= 0 && tgtIdx < cellFunctionalBlockIds.length) {
+        targetFunctionalBlockId = cellFunctionalBlockIds[tgtIdx];
+      }
+    }
 
     // ── Check CH for long-distance acceleration ──
     int chSourceId = ch != null ? ch.findNearestNode(
@@ -317,7 +392,7 @@ public class TimedBidirectionalAStar implements Serializable {
 
         // Expand neighbours
         expandNode(curr, openFwd, bestFwd, parentFwd, true, timeStep,
-                   isDifferential, chPathGuide, tgtRow, tgtCol);
+                   isDifferential, chPathGuide, tgtRow, tgtCol, targetFunctionalBlockId);
       }
 
       if (!expandForward && !openBwd.isEmpty()) {
@@ -336,7 +411,7 @@ public class TimedBidirectionalAStar implements Serializable {
         }
 
         expandNode(curr, openBwd, bestBwd, parentBwd, false, timeStep,
-                   isDifferential, chPathGuide, srcRow, srcCol);
+                   isDifferential, chPathGuide, srcRow, srcCol, srcFunctionalBlockId);
       }
     }
 
@@ -370,7 +445,8 @@ public class TimedBidirectionalAStar implements Serializable {
                           boolean fromStart,
                           int timeStep, boolean isDifferential,
                           List<Integer> chPathGuide,
-                          int targetRow, int targetCol) {
+                          int targetRow, int targetCol,
+                          int targetFunctionalBlockId) {
 
     // ── 4-directional neighbours ──
     int[][] dirs = {{0, 1}, {0, -1}, {1, 0}, {-1, 0}};
@@ -380,8 +456,19 @@ public class TimedBidirectionalAStar implements Serializable {
       int nc = curr.col + d[1];
       if (nr < 0 || nr >= gridRows || nc < 0 || nc >= gridCols) continue;
 
-      // Heuristic to target (or source for backward search)
-      double h = manhattan(nr, nc, targetRow, targetCol) * HEURISTIC_WEIGHT;
+      // ── Arc Flags pruning: skip cells that cannot reach target's functional block ──
+      if (arcFlagsEnabled && arcFlags != null && targetFunctionalBlockId >= 0) {
+        int nIdx = nr * gridCols + nc;
+        if (nIdx >= 0 && nIdx < arcFlags.length) {
+          BitSet flags = arcFlags[nIdx];
+          if (flags != null && !flags.get(targetFunctionalBlockId)) {
+            continue; // prune — this cell cannot reach target's functional block
+          }
+        }
+      }
+
+      // Heuristic to target (ALT or Manhattan for source for backward search)
+      double h = heuristicALT(nr, nc, targetRow, targetCol);
 
       // Differential pair spacing penalty: if the companion diff-pair net
       // has already reserved nearby cells, heavily penalise deviation.
@@ -407,18 +494,6 @@ public class TimedBidirectionalAStar implements Serializable {
         }
       }
 
-      // STOM occupancy penalty
-      double stomCost = 0;
-      if (stom != null) {
-        int occCount = stom.getOccupancyCount(curr.layer, nr, nc);
-        if (occCount > 0) {
-          stomCost = STOM_PENALTY * occCount;
-          if (stom.isOccupied(curr.layer, nr, nc, timeStep)) {
-            stomCost += STOM_PENALTY * 10; // extreme penalty
-          }
-        }
-      }
-
       // Corridor benefit (lower cost for corridor cells)
       double corridorMultiplier = 1.0;
       if (corridorPlanner != null) {
@@ -426,15 +501,49 @@ public class TimedBidirectionalAStar implements Serializable {
         corridorMultiplier = Math.max(0.1, 1.0 - priority * CORRIDOR_BENEFIT);
       }
 
-      // Probabilistic congestion penalty
-      double probCost = 0;
+    // ── V7.x: 拥塞梯度代价 ──
+    double gradientCost = 0;
+    if (congestionGradientEnabled && probEstimator != null) {
+      double[] gradient = probEstimator.getGradientAtCell(nr, nc);
+      if (gradient != null) {
+        // Expand direction (d[0]=dr, d[1]=dc), normalize
+        double dirNorm = Math.sqrt(d[0] * d[0] + d[1] * d[1]);
+        if (dirNorm > 1e-10) {
+          double dot = (gradient[0] * d[0] + gradient[1] * d[1]) / dirNorm;
+          // Moving along gradient (toward congestion) → penalty
+          // Moving against gradient (away from congestion) → no penalty
+          gradientCost = Math.max(0, dot) * congestionGradientWeight;
+        }
+      }
+    }
+
+    // ── V7.x: 时间窗软化 STOM 查询 ──
+    double stomCost = 0;
+    if (stom != null) {
+      if (timeWindowSofteningEnabled) {
+        int softLevel = stom.querySoft(curr.layer, nr, nc, timeStep, timeWindowSize);
+        stomCost = SpatioTemporalOccupancyMap.getSoftSharingCost(
+            softLevel, softSharingCost, STOM_PENALTY);
+      } else {
+        int occCount = stom.getOccupancyCount(curr.layer, nr, nc);
+        if (occCount > 0) {
+          stomCost = STOM_PENALTY * occCount;
+          if (stom.isOccupied(curr.layer, nr, nc, timeStep)) {
+            stomCost += STOM_PENALTY * 10;
+          }
+        }
+      }
+    }
+
+    // Probabilistic congestion penalty
+    double probCost = 0;
       if (probEstimator != null) {
         double congestion = probEstimator.getCongestionAtCell(nr, nc);
         probCost = congestion * 10.0;
       }
 
-      // Base movement cost
-      double moveCost = CELL_SIZE * corridorMultiplier + stomCost + probCost + diffCost;
+      // Base movement cost (includes V7.x gradient cost)
+      double moveCost = CELL_SIZE * corridorMultiplier + stomCost + probCost + diffCost + gradientCost;
 
       // Bend penalty
       if (curr.parent != null) {
@@ -545,6 +654,370 @@ public class TimedBidirectionalAStar implements Serializable {
     return Math.abs(r1 - r2) + Math.abs(c1 - c2);
   }
 
+  /**
+   * ALT heuristic: Max over landmarks of |dist(L, target) - dist(L, node)|.
+   * Falls back to Manhattan if ALT data not available.
+   */
+  private double heuristicALT(int row, int col, int targetRow, int targetCol) {
+    double manh = manhattan(row, col, targetRow, targetCol) * HEURISTIC_WEIGHT;
+    if (!altHeuristicEnabled || landmarkDistances == null || numLandmarks == 0) {
+      return manh;
+    }
+    int targetIdx = targetRow * gridCols + targetCol;
+    int currIdx = row * gridCols + col;
+    if (targetIdx < 0 || targetIdx >= gridRows * gridCols
+        || currIdx < 0 || currIdx >= gridRows * gridCols) {
+      return manh;
+    }
+    double maxAlt = 0;
+    for (int l = 0; l < numLandmarks; l++) {
+      double dTarget = landmarkDistances[l][targetIdx];
+      double dCurr = landmarkDistances[l][currIdx];
+      if (dTarget < Double.MAX_VALUE && dCurr < Double.MAX_VALUE) {
+        double diff = Math.abs(dTarget - dCurr);
+        if (diff > maxAlt) maxAlt = diff;
+      }
+    }
+    // ALT provides a lower bound; take the max with Manhattan
+    // Convert from board-unit distance to cell-count distance
+    return Math.max(manh, maxAlt / CELL_SIZE * HEURISTIC_WEIGHT);
+  }
+
   private int clampCol(int c) { return Math.max(0, Math.min(gridCols - 1, c)); }
   private int clampRow(int r) { return Math.max(0, Math.min(gridRows - 1, r)); }
+
+  // ── ALT + Arc Flags precomputation ──
+
+  /**
+   * Precompute ALT landmark distances.
+   * Selects 6 landmarks (4 corners + 2 center points) and computes shortest
+   * distances from each landmark to all grid cells using the CH graph.
+   * <p>
+   * Landmark selection follows the "max-cover" heuristic: corner landmarks
+   * provide strong bounds for diagonal paths; center landmarks help with
+   * interior-to-interior paths.
+   *
+   * @param ch the Contraction Hierarchies graph
+   */
+  public void precomputeLandmarkDistances(ContractionHierarchies ch) {
+    if (ch == null) return;
+    int cellCount = gridRows * gridCols;
+    if (cellCount <= 0) return;
+
+    // Select 6 landmarks spread across the board
+    int[][] landmarkCells = {
+        {0, 0},                           // top-left corner
+        {0, gridCols - 1},                // top-right corner
+        {gridRows - 1, 0},                // bottom-left corner
+        {gridRows - 1, gridCols - 1},     // bottom-right corner
+        {gridRows / 2, gridCols / 2},     // center
+        {gridRows / 3, gridCols * 2 / 3}  // off-center (for asymmetric coverage)
+    };
+    numLandmarks = landmarkCells.length;
+    landmarkDistances = new double[numLandmarks][cellCount];
+    // Initialize with safe fallback values (Manhattan * CELL_SIZE)
+    for (int l = 0; l < numLandmarks; l++) {
+      int lr = landmarkCells[l][0];
+      int lc = landmarkCells[l][1];
+      for (int r = 0; r < gridRows; r++) {
+        for (int c = 0; c < gridCols; c++) {
+          landmarkDistances[l][r * gridCols + c] = manhattan(lr, lc, r, c) * CELL_SIZE;
+        }
+      }
+    }
+
+    // Compute distances using CH for each landmark
+    for (int l = 0; l < numLandmarks; l++) {
+      int lr = landmarkCells[l][0];
+      int lc = landmarkCells[l][1];
+      double fx = boardMinX + (lc + 0.5) * CELL_SIZE;
+      double fy = boardMinY + (lr + 0.5) * CELL_SIZE;
+      int chSourceId = ch.findNearestNode(new FloatPoint((float) fx, (float) fy), 0);
+      if (chSourceId < 0) continue;
+
+      double[] chDistances = ch.computeAllDistances(chSourceId);
+      if (chDistances == null) continue;
+
+      // Map CH distances to grid cell distances
+      for (int r = 0; r < gridRows; r++) {
+        for (int c = 0; c < gridCols; c++) {
+          int chNodeId = ch.getNodeId(0, r, c);
+          if (chNodeId >= 0 && chDistances[chNodeId] < Double.MAX_VALUE) {
+            landmarkDistances[l][r * gridCols + c] = chDistances[chNodeId];
+          }
+        }
+      }
+      FRLogger.debug("TimedAStar: landmark " + l + " precomputed ("
+          + (gridRows * gridCols) + " cells)");
+    }
+
+    altHeuristicEnabled = true;
+    FRLogger.info("TimedAStar: ALT heuristic enabled with " + numLandmarks + " landmarks");
+  }
+
+  /**
+   * Precompute Arc Flags for functional-block-level pruning.
+   * <p>
+   * For each CH node, determines which functional blocks are reachable via CH
+   * query. Maps this information to grid cells. During A* expandNode, cells
+   * that cannot reach the target's functional block are skipped.
+   *
+   * @param partitioner the multi-level partitioner (provides functional block info)
+   * @param ch          the contraction hierarchies graph
+   */
+  public void precomputeArcFlags(MultiLevelPartitioner partitioner, ContractionHierarchies ch) {
+    if (partitioner == null || ch == null) return;
+    int cellCount = gridRows * gridCols;
+    if (cellCount <= 0) return;
+
+    List<MultiLevelPartitioner.FunctionalBlock> blocks = partitioner.getAllFunctionalBlocks();
+    numFunctionalBlocks = blocks.size();
+    if (numFunctionalBlocks <= 1) {
+      // Single block — no pruning possible
+      arcFlagsEnabled = false;
+      return;
+    }
+
+    // Step 1: Assign functional block ID to each grid cell
+    cellFunctionalBlockIds = new int[cellCount];
+    Arrays.fill(cellFunctionalBlockIds, -1);
+
+    for (int r = 0; r < gridRows; r++) {
+      for (int c = 0; c < gridCols; c++) {
+        double fx = boardMinX + (c + 0.5) * CELL_SIZE;
+        double fy = boardMinY + (r + 0.5) * CELL_SIZE;
+        MultiLevelPartitioner.District dist = partitioner.findDistrict(fx, fy);
+        if (dist != null) {
+          cellFunctionalBlockIds[r * gridCols + c] = dist.functionalBlockId;
+        }
+      }
+    }
+
+    // Step 2: For each functional block, compute which CH nodes can reach it.
+    // Run reverse Dijkstra from boundary nodes of each block.
+    // Simplified: use CH computeAllDistances from a representative node in each block.
+    BitSet[] blockReachability = new BitSet[numFunctionalBlocks];
+    for (int fb = 0; fb < numFunctionalBlocks; fb++) {
+      blockReachability[fb] = new BitSet(ch.getNodeCount());
+    }
+
+    // Find one representative CH node for each functional block
+    int[] repChNodes = new int[numFunctionalBlocks];
+    Arrays.fill(repChNodes, -1);
+    for (CHNode node : ch.getNodes()) {
+      if (node.functionalBlockId >= 0 && node.functionalBlockId < numFunctionalBlocks) {
+        if (repChNodes[node.functionalBlockId] < 0) {
+          repChNodes[node.functionalBlockId] = node.id;
+        }
+      }
+    }
+
+    // Run CH all-distances from each representative to compute reachability
+    for (int fb = 0; fb < numFunctionalBlocks; fb++) {
+      int srcId = repChNodes[fb];
+      if (srcId < 0) continue;
+      double[] dists = ch.computeAllDistances(srcId);
+      if (dists == null) continue;
+      for (int nid = 0; nid < dists.length; nid++) {
+        if (dists[nid] < Double.MAX_VALUE) {
+          blockReachability[fb].set(nid);
+        }
+      }
+    }
+
+    // Step 3: Map CH node reachability to grid cell arc flags.
+    // A grid cell can reach functional block FB if its nearest CH node can reach FB.
+    arcFlags = new BitSet[cellCount];
+    for (int r = 0; r < gridRows; r++) {
+      for (int c = 0; c < gridCols; c++) {
+        int idx = r * gridCols + c;
+        int chNodeId = ch.getNodeId(0, r, c);
+        if (chNodeId < 0) continue;
+        BitSet reachable = new BitSet(numFunctionalBlocks);
+        for (int fb = 0; fb < numFunctionalBlocks; fb++) {
+          if (blockReachability[fb].get(chNodeId)) {
+            reachable.set(fb);
+          }
+        }
+        if (!reachable.isEmpty()) {
+          arcFlags[idx] = reachable;
+        }
+      }
+    }
+
+    arcFlagsEnabled = true;
+    FRLogger.info("TimedAStar: Arc Flags enabled with " + numFunctionalBlocks
+        + " functional blocks");
+  }
+
+  // ── V7.x setters ──
+
+  public void setCongestionGradientEnabled(boolean enabled) {
+    this.congestionGradientEnabled = enabled;
+  }
+
+  public void setCongestionGradientWeight(double weight) {
+    this.congestionGradientWeight = Math.max(0, weight);
+  }
+
+  public void setTimeWindowSofteningEnabled(boolean enabled) {
+    this.timeWindowSofteningEnabled = enabled;
+  }
+
+  public void setTimeWindowSize(int size) {
+    this.timeWindowSize = Math.max(1, size);
+  }
+
+  public void setSoftSharingCost(double cost) {
+    this.softSharingCost = Math.max(0, cost);
+  }
+
+  /** Enable/disable ALT heuristic. */
+  public void setAltHeuristicEnabled(boolean enabled) {
+    this.altHeuristicEnabled = enabled;
+  }
+
+  /** Enable/disable Arc Flags pruning. */
+  public void setArcFlagsEnabled(boolean enabled) {
+    this.arcFlagsEnabled = enabled;
+  }
+
+  /**
+   * V8.2: Pareto Multi-Objective A* search.
+   * <p>
+   * Tracks both path length (obj1) and congestion cost (obj2) independently,
+   * maintaining a Pareto frontier of non-dominated path alternatives per cell.
+   * Returns the Pareto-optimal path that minimizes congestion impact on STOM.
+   * <p>
+   * Only intended for Phase 1 critical backbone nets where path quality matters most.
+   * Standard search is sufficient for Phase 2/3 mass routing.
+   */
+  public SearchResult searchPareto(double srcX, double srcY,
+                                    double tgtX, double tgtY,
+                                    int startLayer, int timeStep) {
+    if (!paretoAStarEnabled) {
+      return search(srcX, srcY, tgtX, tgtY, startLayer, timeStep);
+    }
+
+    int srcCol = clampCol((int) ((srcX - boardMinX) / CELL_SIZE));
+    int srcRow = clampRow((int) ((srcY - boardMinY) / CELL_SIZE));
+    int tgtCol = clampCol((int) ((tgtX - boardMinX) / CELL_SIZE));
+    int tgtRow = clampRow((int) ((tgtY - boardMinY) / CELL_SIZE));
+
+    int layer = startLayer;
+    if (layer < 0 || layer >= layerCount) {
+      layer = signalLayers.length > 0 ? signalLayers[0] : 0;
+    }
+
+    // Replace best-map with ParetoFront map
+    Map<Long, ParetoFront> paretoFrontiers = new HashMap<>();
+    PriorityQueue<SearchNode> open = new PriorityQueue<>();
+    Map<Long, ParetoFront> allFronts = new HashMap<>();
+    double h0 = heuristicALT(srcRow, srcCol, tgtRow, tgtCol);
+
+    SearchNode startNode = new SearchNode(srcRow, srcCol, layer, 0, h0, null, true);
+    open.add(startNode);
+    long startKey = SpatioTemporalOccupancyMap.cellKey(layer, srcRow, srcCol);
+    ParetoFront startFront = new ParetoFront();
+    startFront.tryAdd(new ParetoLabel(0, 0, -1L));
+    paretoFrontiers.put(startKey, startFront);
+
+    long tgtKey = SpatioTemporalOccupancyMap.cellKey(layer, tgtRow, tgtCol);
+    int nodesExpanded = 0;
+    long meetingKey = -1;
+
+    while (!open.isEmpty() && nodesExpanded < MAX_SEARCH_NODES) {
+      SearchNode curr = open.poll();
+      long currKey = SpatioTemporalOccupancyMap.cellKey(curr.layer, curr.row, curr.col);
+      ParetoFront currFront = paretoFrontiers.get(currKey);
+      if (currFront == null) continue;
+
+      // Check if we reached the target
+      if (curr.row == tgtRow && curr.col == tgtCol && curr.layer == layer) {
+        meetingKey = currKey;
+        break;
+      }
+
+      nodesExpanded++;
+
+      // Expand 4-directional neighbours
+      int[][] dirs = {{0, 1}, {0, -1}, {1, 0}, {-1, 0}};
+      for (int[] d : dirs) {
+        int nr = curr.row + d[0], nc = curr.col + d[1];
+        if (nr < 0 || nr >= gridRows || nc < 0 || nc >= gridCols) continue;
+
+        double h = heuristicALT(nr, nc, tgtRow, tgtCol);
+        long nkey = SpatioTemporalOccupancyMap.cellKey(curr.layer, nr, nc);
+
+        // Compute length and congestion separately for Pareto tracking
+        double moveCost = CELL_SIZE;
+        double stomCost = 0;
+        double probCost = 0;
+
+        if (stom != null) {
+          int occ = stom.getOccupancyCount(curr.layer, nr, nc);
+          if (occ > 0) stomCost = STOM_PENALTY * occ;
+        }
+        if (probEstimator != null) {
+          probCost = probEstimator.getCongestionAtCell(nr, nc) * 10.0;
+        }
+
+        double lenIncrement = moveCost;  // obj1
+        double congIncrement = stomCost + probCost; // obj2
+
+        // Build new labels from current Pareto frontier
+        for (ParetoLabel pl : currFront.labels) {
+          double newLen = pl.length + lenIncrement;
+          double newCong = pl.congestion + congIncrement;
+          ParetoLabel newLabel = new ParetoLabel(newLen, newCong, currKey);
+
+          ParetoFront nf = paretoFrontiers.computeIfAbsent(nkey, k -> new ParetoFront());
+          if (nf.tryAdd(newLabel)) {
+            open.add(new SearchNode(nr, nc, curr.layer, newLen + h, h, curr, true));
+          }
+        }
+      }
+    }
+
+    if (meetingKey < 0) return SearchResult.NOT_FOUND;
+
+    // Select Pareto-optimal path with minimum congestion impact
+    ParetoFront targetFront = paretoFrontiers.get(tgtKey);
+    if (targetFront == null) return SearchResult.NOT_FOUND;
+
+    ParetoLabel best = targetFront.getMinCongestion();
+    if (best == null) return SearchResult.NOT_FOUND;
+
+    // Reconstruct path
+    List<Long> pathKeys = new ArrayList<>();
+    long backtrackKey = best.cellKey;
+    while (backtrackKey >= 0 && paretoFrontiers.containsKey(backtrackKey)) {
+      pathKeys.add(0, backtrackKey);
+      ParetoFront pf = paretoFrontiers.get(backtrackKey);
+      ParetoLabel pl = pf.getMinCongestion();
+      backtrackKey = (pl != null) ? pl.cellKey : -1;
+    }
+    pathKeys.add(tgtKey);
+
+    int[] decoded = SpatioTemporalOccupancyMap.decodeCellKey(meetingKey);
+    return new SearchResult(true, pathKeys, best.length + best.congestion, nodesExpanded,
+        decoded[1], decoded[2], decoded[0]);
+  }
+
+  /** Enable/disable Pareto Multi-Objective A*. */
+  public void setParetoAStarEnabled(boolean enabled) {
+    this.paretoAStarEnabled = enabled;
+  }
+
+  /** Check if Pareto A* is active. */
+  public boolean isParetoAStarEnabled() { return paretoAStarEnabled; }
+
+  /** Get number of landmarks used by ALT heuristic. */
+  public int getNumLandmarks() { return numLandmarks; }
+
+  /** Check if ALT heuristic is active. */
+  public boolean isAltHeuristicEnabled() { return altHeuristicEnabled; }
+
+  /** Check if Arc Flags pruning is active. */
+  public boolean isArcFlagsEnabled() { return arcFlagsEnabled; }
 }

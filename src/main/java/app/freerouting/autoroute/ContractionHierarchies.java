@@ -454,6 +454,14 @@ public class ContractionHierarchies implements Serializable {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
+   * Layer mask constants for layer-aware CH queries.
+   */
+  public static final int LAYER_MASK_ALL = 0;
+  public static final int LAYER_MASK_SUBWAY = 1;   // Grade 2 — inner layers (e.g. 2-3)
+  public static final int LAYER_MASK_ELEVATED = 2; // Grade 1 — near-surface (e.g. 1,4)
+  public static final int LAYER_MASK_SURFACE = 4;  // Grade 0 — outer layers (e.g. 0,5)
+
+  /**
    * Result of a CH shortest-path query.
    */
   public static class CHPath implements Serializable {
@@ -488,6 +496,21 @@ public class ContractionHierarchies implements Serializable {
    * @return shortest path result
    */
   public CHPath query(int sourceId, int targetId) {
+    return query(sourceId, targetId, LAYER_MASK_ALL);
+  }
+
+  /**
+   * Layer-aware bidirectional Dijkstra query on the CH graph.
+   * <p>
+   * When {@code layerMask != LAYER_MASK_ALL}, only nodes belonging to layers
+   * matching the mask are expanded, reducing the effective search graph.
+   *
+   * @param sourceId  source node ID
+   * @param targetId  target node ID
+   * @param layerMask bitmask of allowed layers (LAYER_MASK_SUBWAY, etc.)
+   * @return shortest path result
+   */
+  public CHPath query(int sourceId, int targetId, int layerMask) {
     if (sourceId < 0 || sourceId >= nodes.size()
         || targetId < 0 || targetId >= nodes.size()) {
       return CHPath.NOT_FOUND;
@@ -500,15 +523,19 @@ public class ContractionHierarchies implements Serializable {
     PriorityQueue<SearchState> forwardPQ = new PriorityQueue<>();
     Map<Integer, Double> forwardDist = new HashMap<>();
     Map<Integer, Integer> forwardPrev = new HashMap<>();
-    forwardPQ.add(new SearchState(sourceId, 0.0));
-    forwardDist.put(sourceId, 0.0);
+    if (!isLayerExcluded(sourceId, layerMask)) {
+      forwardPQ.add(new SearchState(sourceId, 0.0));
+      forwardDist.put(sourceId, 0.0);
+    }
 
     // ── Backward search (target → source, downward edges) ──
     PriorityQueue<SearchState> backwardPQ = new PriorityQueue<>();
     Map<Integer, Double> backwardDist = new HashMap<>();
     Map<Integer, Integer> backwardPrev = new HashMap<>();
-    backwardPQ.add(new SearchState(targetId, 0.0));
-    backwardDist.put(targetId, 0.0);
+    if (!isLayerExcluded(targetId, layerMask)) {
+      backwardPQ.add(new SearchState(targetId, 0.0));
+      backwardDist.put(targetId, 0.0);
+    }
 
     double bestPathWeight = Double.MAX_VALUE;
     int meetingNode = -1;
@@ -523,10 +550,10 @@ public class ContractionHierarchies implements Serializable {
         CHNode fwdNode = nodes.get(fwd.nodeId);
         // Explore upward: only neighbours with level >= current
         for (Map.Entry<Integer, Double> e : fwdNode.originalEdges.entrySet()) {
-          relaxForward(e.getKey(), e.getValue(), fwd, forwardDist, forwardPrev, forwardPQ, fwdNode.level);
+          relaxForward(e.getKey(), e.getValue(), fwd, forwardDist, forwardPrev, forwardPQ, fwdNode.level, layerMask);
         }
         for (Map.Entry<Integer, CHNode.ShortcutInfo> e : fwdNode.shortcuts.entrySet()) {
-          relaxForward(e.getKey(), e.getValue().weight, fwd, forwardDist, forwardPrev, forwardPQ, fwdNode.level);
+          relaxForward(e.getKey(), e.getValue().weight, fwd, forwardDist, forwardPrev, forwardPQ, fwdNode.level, layerMask);
         }
 
         // Check meeting
@@ -548,10 +575,10 @@ public class ContractionHierarchies implements Serializable {
         CHNode bwdNode = nodes.get(bwd.nodeId);
         // Explore downward: only neighbours with level <= current
         for (Map.Entry<Integer, Double> e : bwdNode.originalEdges.entrySet()) {
-          relaxBackward(e.getKey(), e.getValue(), bwd, backwardDist, backwardPrev, backwardPQ, bwdNode.level);
+          relaxBackward(e.getKey(), e.getValue(), bwd, backwardDist, backwardPrev, backwardPQ, bwdNode.level, layerMask);
         }
         for (Map.Entry<Integer, CHNode.ShortcutInfo> e : bwdNode.shortcuts.entrySet()) {
-          relaxBackward(e.getKey(), e.getValue().weight, bwd, backwardDist, backwardPrev, backwardPQ, bwdNode.level);
+          relaxBackward(e.getKey(), e.getValue().weight, bwd, backwardDist, backwardPrev, backwardPQ, bwdNode.level, layerMask);
         }
 
         // Check meeting
@@ -575,7 +602,14 @@ public class ContractionHierarchies implements Serializable {
   private void relaxForward(int nbId, double edgeWeight, SearchState current,
                             Map<Integer, Double> dist, Map<Integer, Integer> prev,
                             PriorityQueue<SearchState> pq, int currentLevel) {
+    relaxForward(nbId, edgeWeight, current, dist, prev, pq, currentLevel, LAYER_MASK_ALL);
+  }
+
+  private void relaxForward(int nbId, double edgeWeight, SearchState current,
+                            Map<Integer, Double> dist, Map<Integer, Integer> prev,
+                            PriorityQueue<SearchState> pq, int currentLevel, int layerMask) {
     if (nbId < 0 || nbId >= nodes.size()) return;
+    if (isLayerExcluded(nbId, layerMask)) return;
     CHNode nb = nodes.get(nbId);
     if (nb.level < currentLevel) return; // upward only
     if (nb.isBlocked) return;
@@ -590,7 +624,14 @@ public class ContractionHierarchies implements Serializable {
   private void relaxBackward(int nbId, double edgeWeight, SearchState current,
                              Map<Integer, Double> dist, Map<Integer, Integer> prev,
                              PriorityQueue<SearchState> pq, int currentLevel) {
+    relaxBackward(nbId, edgeWeight, current, dist, prev, pq, currentLevel, LAYER_MASK_ALL);
+  }
+
+  private void relaxBackward(int nbId, double edgeWeight, SearchState current,
+                             Map<Integer, Double> dist, Map<Integer, Integer> prev,
+                             PriorityQueue<SearchState> pq, int currentLevel, int layerMask) {
     if (nbId < 0 || nbId >= nodes.size()) return;
+    if (isLayerExcluded(nbId, layerMask)) return;
     CHNode nb = nodes.get(nbId);
     if (nb.level > currentLevel) return; // downward only
     if (nb.isBlocked) return;
@@ -600,6 +641,26 @@ public class ContractionHierarchies implements Serializable {
       prev.put(nbId, current.nodeId);
       pq.add(new SearchState(nbId, newDist));
     }
+  }
+
+  /** Check if a node's layer is excluded by the given mask. */
+  private boolean isLayerExcluded(int nodeId, int layerMask) {
+    if (layerMask == LAYER_MASK_ALL) return false;
+    if (nodeId < 0 || nodeId >= nodes.size()) return true;
+    CHNode n = nodes.get(nodeId);
+    // Determine which layer grade this node belongs to
+    // Surface = outer layers (Grade 0), Elevated = near-surface (Grade 1), Subway = inner (Grade 2)
+    int grade;
+    if (n.layer == 0 || n.layer == layerCount - 1) {
+      grade = 0; // Surface
+    } else if (n.layer == 1 || n.layer == layerCount - 2) {
+      grade = 1; // Elevated
+    } else {
+      grade = 2; // Subway (inner layers)
+    }
+    int nodeMask = (grade == 2) ? LAYER_MASK_SUBWAY
+        : (grade == 1) ? LAYER_MASK_ELEVATED : LAYER_MASK_SURFACE;
+    return (layerMask & nodeMask) == 0;
   }
 
   /** Reconstruct the full path from source to target via the meeting node. */
@@ -811,6 +872,74 @@ public class ContractionHierarchies implements Serializable {
   // ═══════════════════════════════════════════════════════════════════════
   //  Inner types
   // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Compute shortest distances from a source node to ALL other nodes.
+   * Uses forward Dijkstra on the full CH graph (both upward and downward edges).
+   * Used by ALT heuristic landmark precomputation.
+   *
+   * @param sourceId source node ID
+   * @return array of distances indexed by node ID (Double.MAX_VALUE = unreachable)
+   */
+  public double[] computeAllDistances(int sourceId) {
+    int n = nodes.size();
+    double[] dist = new double[n];
+    Arrays.fill(dist, Double.MAX_VALUE);
+    if (sourceId < 0 || sourceId >= n) return dist;
+
+    PriorityQueue<SearchState> pq = new PriorityQueue<>();
+    dist[sourceId] = 0.0;
+    pq.add(new SearchState(sourceId, 0.0));
+
+    while (!pq.isEmpty()) {
+      SearchState curr = pq.poll();
+      if (curr.dist != dist[curr.nodeId]) continue;
+
+      CHNode node = nodes.get(curr.nodeId);
+      if (node == null) continue;
+
+      // Explore original edges (all neighbours, no level restriction)
+      for (Map.Entry<Integer, Double> e : node.originalEdges.entrySet()) {
+        int nbId = e.getKey();
+        if (nbId < 0 || nbId >= n) continue;
+        double nd = curr.dist + e.getValue();
+        if (nd < dist[nbId]) {
+          dist[nbId] = nd;
+          pq.add(new SearchState(nbId, nd));
+        }
+      }
+
+      // Explore shortcuts
+      for (Map.Entry<Integer, CHNode.ShortcutInfo> e : node.shortcuts.entrySet()) {
+        int nbId = e.getKey();
+        if (nbId < 0 || nbId >= n) continue;
+        double nd = curr.dist + e.getValue().weight;
+        if (nd < dist[nbId]) {
+          dist[nbId] = nd;
+          pq.add(new SearchState(nbId, nd));
+        }
+      }
+    }
+    return dist;
+  }
+
+  /**
+   * Get the functional block ID for a given node.
+   * Returns -1 if unassigned or node out of range.
+   */
+  public int getNodeFunctionalBlock(int nodeId) {
+    if (nodeId < 0 || nodeId >= nodes.size()) return -1;
+    return nodes.get(nodeId).functionalBlockId;
+  }
+
+  /**
+   * Get the district ID for a given node.
+   * Returns -1 if unassigned or node out of range.
+   */
+  public int getNodeDistrict(int nodeId) {
+    if (nodeId < 0 || nodeId >= nodes.size()) return -1;
+    return nodes.get(nodeId).districtId;
+  }
 
   /** State for CH search (priority queue element). */
   static class SearchState implements Comparable<SearchState> {

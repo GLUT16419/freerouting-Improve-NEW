@@ -311,6 +311,67 @@ public class SpatioTemporalOccupancyMap implements Serializable {
   }
 
   // ═══════════════════════════════════════════════════════════════════════
+  //  时间窗软化 (V7.x) — Softened temporal occupancy query
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /**
+   * Soft occupancy query with temporal window.
+   * <p>
+   * Returns a conflict level rather than a boolean:
+   * <ul>
+   *   <li>0 = free (no occupancy within the time window)</li>
+   *   <li>1 = soft conflict (occupied within [t-w, t+w] but NOT at exact t)</li>
+   *   <li>2 = hard conflict (occupied exactly at time step t)</li>
+   * </ul>
+   * <p>
+   * This allows networks to "time-share" a channel by offsetting their
+   * reservations by a few time steps, reducing unnecessary detours.
+   *
+   * @param layer     PCB layer index
+   * @param row       grid row
+   * @param col       grid column
+   * @param timeStep  the time step to check
+   * @param windowSize the softening window (± steps)
+   * @return conflict level (0=free, 1=soft, 2=hard)
+   */
+  public int querySoft(int layer, int row, int col, int timeStep, int windowSize) {
+    long key = cellKey(layer, row, col);
+    BitSet bs = occupancyMap.get(key);
+    if (bs == null) return 0;
+
+    // Hard conflict: exact time step occupied
+    if (bs.get(timeStep)) return 2;
+
+    // Soft conflict: check within [timeStep - windowSize, timeStep + windowSize]
+    int tMin = Math.max(0, timeStep - windowSize);
+    int tMax = Math.min(MAX_TIME_STEPS - 1, timeStep + windowSize);
+    for (int t = bs.nextSetBit(tMin); t >= 0 && t <= tMax; t = bs.nextSetBit(t + 1)) {
+      return 1; // occupied within window
+    }
+
+    return 0; // free
+  }
+
+  /**
+   * Get the soft sharing cost for a conflict level.
+   *
+   * @param conflictLevel result from {@link #querySoft}
+   * @param softSharingCost the cost for soft sharing
+   * @param hardPenaltyMultiplier multiplier for hard conflicts
+   * @return the cost to add
+   */
+  public static double getSoftSharingCost(int conflictLevel,
+                                           double softSharingCost,
+                                           double hardPenaltyMultiplier) {
+    switch (conflictLevel) {
+      case 0: return 0.0;  // free
+      case 1: return softSharingCost; // soft sharing allowed
+      case 2: return softSharingCost + 100.0 * hardPenaltyMultiplier; // hard conflict — high penalty
+      default: return Double.MAX_VALUE;
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
   //  Stats
   // ═══════════════════════════════════════════════════════════════════════
 

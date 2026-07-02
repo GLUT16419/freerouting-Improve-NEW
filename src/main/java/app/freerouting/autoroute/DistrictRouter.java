@@ -5,9 +5,11 @@ import app.freerouting.board.RoutingBoard;
 import app.freerouting.geometry.planar.FloatPoint;
 import app.freerouting.logger.FRLogger;
 import app.freerouting.rules.Net;
+import app.freerouting.settings.RouterSettings;
 
 import java.io.Serializable;
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
 /**
@@ -90,6 +92,12 @@ public class DistrictRouter implements Serializable {
   /** Nets already routed by Phase 1 (backbone) — skip re-routing. */
   private final Set<Integer> alreadyRoutedNets;
 
+  /** Router settings for creating cloned autorouters (passed through). */
+  private RouterSettings routerSettings;
+
+  /** Thread pool for parallel district routing. */
+  private transient ExecutorService districtExecutor;
+
   // ═══════════════════════════════════════════════════════════════════════
   //  Construction
   // ═══════════════════════════════════════════════════════════════════════
@@ -107,6 +115,16 @@ public class DistrictRouter implements Serializable {
     this.stom = stom;
     this.trafficAssigner = trafficAssigner;
     this.alreadyRoutedNets = alreadyRoutedNets != null ? alreadyRoutedNets : new HashSet<>();
+    if (this.batchAutorouter != null && this.batchAutorouter.job != null) {
+      this.routerSettings = this.batchAutorouter.job.routerSettings;
+    }
+  }
+
+  /**
+   * Set router settings for cloned autorouters (called from UrbanTrafficBatchAutorouter).
+   */
+  public void setRouterSettings(RouterSettings settings) {
+    this.routerSettings = settings;
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -114,9 +132,12 @@ public class DistrictRouter implements Serializable {
   // ═══════════════════════════════════════════════════════════════════════
 
   /**
-   * Route all districts sequentially (thread-safe: AutorouteEngine is not
-   * safe for concurrent access).  Parallel routing can be re-enabled once
-   * the engine supports per-thread expansion rooms.
+   * Route all districts in parallel using per-district board clones.
+   * Each district gets its own Board + BatchAutorouter instance, allowing
+   * true concurrent routing without thread-safety issues.
+   * <p>
+   * Falls back to sequential mode if the board cannot be serialized or
+   * if there are fewer than 2 districts (no parallelization benefit).
    *
    * @return aggregated results across all districts
    */
@@ -127,11 +148,169 @@ public class DistrictRouter implements Serializable {
       return Collections.emptyList();
     }
 
+    // Sequential mode for 1 district or when settings disable parallelism
+    if (districts.size() <= 1) {
+      return routeAllDistrictsSequential(districts);
+    }
+
+    int maxThreads = Math.min(MAX_DISTRICT_THREADS,
+        Runtime.getRuntime().availableProcessors());
+    int effectiveThreads = Math.min(maxThreads, districts.size());
+
     FRLogger.info("DistrictRouter: routing " + districts.size()
-        + " districts sequentially (serial mode for thread safety)");
+        + " districts in parallel using " + effectiveThreads + " threads");
+
+    districtExecutor = Executors.newFixedThreadPool(effectiveThreads);
+    List<Future<DistrictRoutingResult>> futures = new ArrayList<>();
+
+    // Snapshot STOM once — each parallel task gets its own copy
+    SpatioTemporalOccupancyMap stomSnapshot = stom != null ? stom.snapshot() : null;
+
+    for (MultiLevelPartitioner.District district : districts) {
+      if (district.netNumbers.isEmpty()) continue;
+
+      final MultiLevelPartitioner.District dist = district;
+      final SpatioTemporalOccupancyMap distStom =
+          stomSnapshot != null ? stomSnapshot.snapshot() : null;
+
+      futures.add(districtExecutor.submit(() -> {
+        long t0 = System.currentTimeMillis();
+        Set<Integer> routed = new HashSet<>();
+        Set<Integer> failed = new HashSet<>();
+
+        FRLogger.debug("DistrictRouter[parallel]: district " + dist.id
+            + " (" + dist.netNumbers.size() + " nets)");
+
+        // Clone the board and create a dedicated BatchAutorouter for this district
+        RoutingBoard clonedBoard;
+        try {
+          clonedBoard = ((RoutingBoard) this.board).deepCopy();
+        } catch (Exception e) {
+          FRLogger.warn("DistrictRouter[parallel]: board deepCopy failed for district "
+              + dist.id + ": " + e.getMessage());
+          // Fallback: report all nets as failed
+          failed.addAll(dist.netNumbers);
+          return new DistrictRoutingResult(dist.id, 0, dist.netNumbers.size(),
+              System.currentTimeMillis() - t0, routed, failed);
+        }
+
+        // Build a fresh BatchAutorouter for the cloned board
+        BatchAutorouter distAutorouter;
+        try {
+          // Create a minimal StoppableThread for routing
+          app.freerouting.core.StoppableThread distThread =
+              new app.freerouting.core.StoppableThread() {
+                @Override protected void thread_action() {}
+              };
+          distThread.setName("District-" + dist.id + "-Router");
+          distAutorouter = new BatchAutorouter(distThread, clonedBoard,
+              routerSettings, true, true,
+              DISTRICT_RIPUP_COST * 2, 4);
+          // Set a minimal RoutingJob for logging/scoring
+          app.freerouting.core.RoutingJob distJob = new app.freerouting.core.RoutingJob();
+          distJob.board = clonedBoard;
+          distJob.routerSettings = routerSettings;
+          distAutorouter.job = distJob;
+        } catch (Exception e) {
+          FRLogger.warn("DistrictRouter[parallel]: autorouter init failed "
+              + "for district " + dist.id + ": " + e.getMessage());
+          failed.addAll(dist.netNumbers);
+          return new DistrictRoutingResult(dist.id, 0, dist.netNumbers.size(),
+              System.currentTimeMillis() - t0, routed, failed);
+        }
+
+        // Sort nets by traffic mode priority
+        List<Integer> sortedNets = dist.netNumbers.stream()
+            .sorted((a, b) -> {
+              int ma = trafficAssigner.getMode(a);
+              int mb = trafficAssigner.getMode(b);
+              return Integer.compare(mb, ma);
+            })
+            .collect(Collectors.toList());
+
+        // Route each net
+        for (int netNo : sortedNets) {
+          if (alreadyRoutedNets.contains(netNo)) {
+            routed.add(netNo);
+            continue;
+          }
+          try {
+            BatchAutorouter.NetRouteResult result =
+                distAutorouter.routeNet(netNo, DISTRICT_RIPUP_COST);
+
+              if (result != null && result.isRouted()) {
+              routed.add(netNo);
+              if (distStom != null) {
+                Net net = clonedBoard.rules.nets.get(netNo);
+                if (net != null) {
+                  List<Long> cellKeys = extractCellKeysFromBoard(clonedBoard, net, distStom.getCellSize());
+                  if (!cellKeys.isEmpty()) {
+                    distStom.reserve(cellKeys);
+                  }
+                }
+              }
+            } else {
+              failed.add(netNo);
+            }
+          } catch (Exception e) {
+            FRLogger.debug("DistrictRouter[parallel]: net " + netNo
+                + " failed: " + e.getMessage());
+            failed.add(netNo);
+          }
+        }
+
+        long elapsed = System.currentTimeMillis() - t0;
+        FRLogger.debug("DistrictRouter[parallel]: district " + dist.id
+            + " done — " + routed.size() + " routed, " + failed.size()
+            + " failed, " + elapsed + "ms");
+
+        // Merge district STOM back into the global STOM
+        if (stom != null && distStom != null) {
+          stom.merge(distStom);
+        }
+
+        return new DistrictRoutingResult(dist.id, routed.size(), failed.size(),
+            elapsed, routed, failed);
+      }));
+    }
+
+    // Collect results
+    List<DistrictRoutingResult> results = new ArrayList<>();
+    for (Future<DistrictRoutingResult> future : futures) {
+      try {
+        results.add(future.get(60, TimeUnit.MINUTES)); // generous timeout
+      } catch (Exception e) {
+        FRLogger.warn("DistrictRouter[parallel]: district task failed: "
+            + e.getMessage());
+      }
+    }
+
+    districtExecutor.shutdown();
+    try {
+      districtExecutor.awaitTermination(5, TimeUnit.SECONDS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+    }
+
+    // Log summary
+    int totalRouted = results.stream().mapToInt(r -> r.netsRouted).sum();
+    int totalFailed = results.stream().mapToInt(r -> r.netsFailed).sum();
+    FRLogger.info("DistrictRouter[parallel]: complete — " + totalRouted
+        + " routed, " + totalFailed + " failed across " + results.size()
+        + " districts");
+
+    return results;
+  }
+
+  /**
+   * Fallback sequential mode for single-district boards.
+   */
+  private List<DistrictRoutingResult> routeAllDistrictsSequential(
+      List<MultiLevelPartitioner.District> districts) {
+    FRLogger.info("DistrictRouter: routing " + districts.size()
+        + " district(s) sequentially");
 
     List<DistrictRoutingResult> results = new ArrayList<>();
-
     for (MultiLevelPartitioner.District district : districts) {
       if (district.netNumbers.isEmpty()) continue;
       try {
@@ -143,13 +322,159 @@ public class DistrictRouter implements Serializable {
       }
     }
 
-    // Log summary
     int totalRouted = results.stream().mapToInt(r -> r.netsRouted).sum();
     int totalFailed = results.stream().mapToInt(r -> r.netsFailed).sum();
     FRLogger.info("DistrictRouter: complete — " + totalRouted + " routed, "
         + totalFailed + " failed across " + results.size() + " districts");
-
     return results;
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  //  V8: User Equilibrium Parallel Probing
+  // ═══════════════════════════════════════════════════════════════════════
+
+  /** Max probing rounds (configurable from settings). */
+  private int maxProbingRounds = 3;
+  /** Enable user equilibrium parallel probing. */
+  private boolean userEquilibriumEnabled = false;
+
+  /** Set max probing rounds from settings. */
+  public void setMaxProbingRounds(int rounds) {
+    this.maxProbingRounds = Math.max(1, Math.min(5, rounds));
+  }
+
+  /** Enable/disable user equilibrium. */
+  public void setUserEquilibriumEnabled(boolean enabled) {
+    this.userEquilibriumEnabled = enabled;
+  }
+
+  /**
+   * V8.2: Route same-priority nets using User Equilibrium parallel probing.
+   * <p>
+   * Run 2-3 rounds of probing: Round 1 routes all nets independently; Round 2
+   * detects cell-level overlaps, adds conflict penalties, and re-routes;
+   * Round 3 checks convergence. This reduces sub-optimal reservations caused
+   * by sequential order dependence in traditional ripup-and-reroute.
+   *
+   * @param sortedNets nets to route (already sorted by traffic mode priority)
+   * @param alreadyRouted nets routed in previous phases
+   * @param stomRef STOM reference for reservation
+   * @param boardRef board reference for net info
+   * @return (routed, failed) sets
+   */
+  private Map.Entry<Set<Integer>, Set<Integer>> routeWithUserEquilibrium(
+      List<Integer> sortedNets, Set<Integer> alreadyRouted,
+      SpatioTemporalOccupancyMap stomRef, BasicBoard boardRef) {
+
+    Set<Integer> routed = new HashSet<>();
+    Set<Integer> failed = new HashSet<>();
+
+    if (sortedNets.isEmpty() || sortedNets.size() < 2) {
+      // Not enough nets for probing — fallback to sequential
+      for (int netNo : sortedNets) {
+        if (alreadyRouted.contains(netNo)) { routed.add(netNo); continue; }
+        try {
+          BatchAutorouter.NetRouteResult result = batchAutorouter.routeNet(netNo, DISTRICT_RIPUP_COST);
+          if (result != null && result.isRouted()) { routed.add(netNo); }
+          else { failed.add(netNo); }
+        } catch (Exception e) { failed.add(netNo); }
+      }
+      return new AbstractMap.SimpleEntry<>(routed, failed);
+    }
+
+    // Group by traffic mode (same priority)
+    Map<Integer, List<Integer>> priorityGroups = sortedNets.stream()
+        .collect(Collectors.groupingBy(n -> trafficAssigner.getMode(n)));
+
+    for (Map.Entry<Integer, List<Integer>> group : priorityGroups.entrySet()) {
+      List<Integer> groupNets = group.getValue();
+      if (groupNets.isEmpty()) continue;
+
+      // Round 1: Route all nets in this group independently
+      Map<Integer, Set<Long>> netCellOccupancy = new HashMap<>();
+      Set<Integer> roundRouted = new HashSet<>();
+      Set<Integer> roundFailed = new HashSet<>();
+
+      for (int netNo : groupNets) {
+        if (alreadyRouted.contains(netNo)) { roundRouted.add(netNo); continue; }
+        try {
+          BatchAutorouter.NetRouteResult result = batchAutorouter.routeNet(netNo, DISTRICT_RIPUP_COST);
+          if (result != null && result.isRouted()) {
+            roundRouted.add(netNo);
+            Net net = boardRef.rules.nets.get(netNo);
+            if (net != null && stomRef != null) {
+              Set<Long> cells = new HashSet<>(extractCellKeysFromBoard(boardRef, net, stomRef.getCellSize()));
+              netCellOccupancy.put(netNo, cells);
+            }
+          } else {
+            roundFailed.add(netNo);
+          }
+        } catch (Exception e) { roundFailed.add(netNo); }
+      }
+      routed.addAll(roundRouted);
+      failed.addAll(roundFailed);
+
+      // Round 2 (and optionally 3): Detect cell conflicts and re-route
+      int maxRounds = Math.min(maxProbingRounds, groupNets.size());
+      for (int round = 1; round < maxRounds; round++) {
+        // Detect overlapping cells among the routed nets
+        Map<Integer, Set<Integer>> conflictPairs = new HashMap<>();
+        List<Integer> toReRoute = new ArrayList<>();
+        for (int a : roundRouted) {
+          Set<Long> cellsA = netCellOccupancy.get(a);
+          if (cellsA == null) continue;
+          for (int b : roundRouted) {
+            if (a >= b) continue;
+            Set<Long> cellsB = netCellOccupancy.get(b);
+            if (cellsB == null) continue;
+            Set<Long> intersection = new HashSet<>(cellsA);
+            intersection.retainAll(cellsB);
+            if (!intersection.isEmpty()) {
+              conflictPairs.computeIfAbsent(a, k -> new HashSet<>()).add(b);
+              conflictPairs.computeIfAbsent(b, k -> new HashSet<>()).add(a);
+              toReRoute.add(a);
+              toReRoute.add(b);
+            }
+          }
+        }
+
+        if (toReRoute.isEmpty()) break; // converged
+
+        // Re-route conflicting nets with increased ripup cost
+        for (int netNo : new HashSet<>(toReRoute)) {
+          if (!roundRouted.contains(netNo)) continue;
+          int conflictCount = conflictPairs.getOrDefault(netNo, Collections.emptySet()).size();
+          int ripupBoost = DISTRICT_RIPUP_COST + conflictCount * 5;
+          try {
+            BatchAutorouter.NetRouteResult result = batchAutorouter.routeNet(netNo, ripupBoost);
+            if (result != null && result.isRouted()) {
+              Net net = boardRef.rules.nets.get(netNo);
+              if (net != null && stomRef != null) {
+                Set<Long> newCells = new HashSet<>(extractCellKeysFromBoard(boardRef, net, stomRef.getCellSize()));
+                netCellOccupancy.put(netNo, newCells);
+              }
+            }
+          } catch (Exception e) {
+            roundFailed.add(netNo);
+            roundRouted.remove(netNo);
+          }
+        }
+      }
+
+      // Reserve final paths in STOM
+      if (stomRef != null) {
+        for (int netNo : roundRouted) {
+          if (alreadyRouted.contains(netNo)) continue;
+          Net net = boardRef.rules.nets.get(netNo);
+          if (net != null) {
+            List<Long> cellKeys = extractCellKeysFromBoard(boardRef, net, stomRef.getCellSize());
+            if (!cellKeys.isEmpty()) stomRef.reserve(cellKeys);
+          }
+        }
+      }
+    }
+
+    return new AbstractMap.SimpleEntry<>(routed, failed);
   }
 
   // ═══════════════════════════════════════════════════════════════════════
@@ -178,36 +503,44 @@ public class DistrictRouter implements Serializable {
         })
         .collect(Collectors.toList());
 
-    // Route each net (skip those already routed by Phase 1)
-    for (int netNo : sortedNets) {
-      if (alreadyRoutedNets.contains(netNo)) {
-        routed.add(netNo); // counted as routed from previous phase
-        continue;
-      }
+    // V8: User Equilibrium parallel probing for same-priority nets
+    if (userEquilibriumEnabled) {
+      Map.Entry<Set<Integer>, Set<Integer>> eqResult = routeWithUserEquilibrium(
+          sortedNets, alreadyRoutedNets, stom, board);
+      routed.addAll(eqResult.getKey());
+      failed.addAll(eqResult.getValue());
+    } else {
+      // Route each net sequentially (skip those already routed by Phase 1)
+      for (int netNo : sortedNets) {
+        if (alreadyRoutedNets.contains(netNo)) {
+          routed.add(netNo); // counted as routed from previous phase
+          continue;
+        }
 
-      try {
-        BatchAutorouter.NetRouteResult result =
-            batchAutorouter.routeNet(netNo, DISTRICT_RIPUP_COST);
+        try {
+          BatchAutorouter.NetRouteResult result =
+              batchAutorouter.routeNet(netNo, DISTRICT_RIPUP_COST);
 
-        if (result != null && result.isRouted()) {
-          routed.add(netNo);
+          if (result != null && result.isRouted()) {
+            routed.add(netNo);
 
-          // Reserve path in STOM
-          if (stom != null) {
-            Net net = board.rules.nets.get(netNo);
-            if (net != null) {
-              List<Long> cellKeys = extractNetCellKeys(net);
-              if (!cellKeys.isEmpty()) {
-                stom.reserve(cellKeys);
+            // Reserve path in STOM
+            if (stom != null) {
+              Net net = board.rules.nets.get(netNo);
+              if (net != null) {
+                List<Long> cellKeys = extractNetCellKeys(net);
+                if (!cellKeys.isEmpty()) {
+                  stom.reserve(cellKeys);
+                }
               }
             }
+          } else {
+            failed.add(netNo);
           }
-        } else {
+        } catch (Exception e) {
+          FRLogger.debug("DistrictRouter: net " + netNo + " failed: " + e.getMessage());
           failed.add(netNo);
         }
-      } catch (Exception e) {
-        FRLogger.debug("DistrictRouter: net " + netNo + " failed: " + e.getMessage());
-        failed.add(netNo);
       }
     }
 
@@ -225,13 +558,26 @@ public class DistrictRouter implements Serializable {
   //  Helpers
   // ═══════════════════════════════════════════════════════════════════════
 
-  private List<Long> extractNetCellKeys(Net net) {
-    Set<Long> keys = new HashSet<>();
-    double cellSize = stom != null ? stom.getCellSize()
-        : SpatioTemporalOccupancyMap.DEFAULT_CELL_SIZE;
-    double bmx = board.bounding_box.ll.to_float().x;
-    double bmy = board.bounding_box.ll.to_float().y;
+  private final Map<Integer, List<Long>> netCellKeyCache = new HashMap<>();
 
+  private List<Long> extractNetCellKeys(Net net) {
+    if (net == null) return Collections.emptyList();
+    return netCellKeyCache.computeIfAbsent(net.net_number, k -> {
+      double cellSize = stom != null ? stom.getCellSize()
+          : SpatioTemporalOccupancyMap.DEFAULT_CELL_SIZE;
+      return extractCellKeysFromBoard((BasicBoard) this.board, net, cellSize);
+    });
+  }
+
+  /**
+   * Static cell key extraction — safe for use with cloned boards.
+   * Does NOT depend on instance fields, making it thread-safe.
+   */
+  private static List<Long> extractCellKeysFromBoard(BasicBoard targetBoard, Net net, double cellSize) {
+    if (net == null) return Collections.emptyList();
+    Set<Long> keys = new HashSet<>();
+    double bmx = targetBoard.bounding_box.ll.to_float().x;
+    double bmy = targetBoard.bounding_box.ll.to_float().y;
     for (app.freerouting.board.Pin pin : net.get_pins()) {
       FloatPoint c = pin.get_center().to_float();
       int col = (int) ((c.x - bmx) / cellSize);

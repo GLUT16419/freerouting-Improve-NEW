@@ -13,7 +13,7 @@ import java.util.Locale;
  */
 public class ClearanceMatrix implements Serializable {
 
-  public static final int clearance_safety_margin = 16;
+  public static final int clearance_safety_margin = 200;
   private final LayerStructure layer_structure;
   private final int[] max_value_on_layer; //  maximum clearance value for each layer
   /**

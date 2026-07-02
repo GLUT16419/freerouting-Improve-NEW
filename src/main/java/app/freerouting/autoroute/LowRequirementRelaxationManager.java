@@ -44,6 +44,9 @@ public class LowRequirementRelaxationManager implements Serializable {
 
   private boolean relaxationEnabled = true;
 
+  // ── 最大空隙优先 (V7.x) ──
+  private boolean maxGapFirstEnabled = false;
+
   // ═══════════════════════════════════════════════════════════════════════
   //  Construction
   // ═══════════════════════════════════════════════════════════════════════
@@ -172,6 +175,31 @@ public class LowRequirementRelaxationManager implements Serializable {
   public void setRelaxationEnabled(boolean enabled) { this.relaxationEnabled = enabled; }
 
   public boolean isRelaxationEnabled() { return relaxationEnabled; }
+
+  /** Enable/disable max gap first guidance (V7.x). */
+  public void setMaxGapFirstEnabled(boolean enabled) { this.maxGapFirstEnabled = enabled; }
+
+  public boolean isMaxGapFirstEnabled() { return maxGapFirstEnabled; }
+
+  /**
+   * Apply max-gap guidance: find the largest free rectangle between source
+   * and target, and return it to guide the A* search.
+   *
+   * @param obstacleGrid 2D grid: 0 = free, > 0 = obstacle/occupied
+   * @param srcR    source row
+   * @param srcC    source col
+   * @param tgtR    target row
+   * @param tgtC    target col
+   * @return the gap result, or NOT_FOUND if no significant gap exists
+   */
+  public MaxGapFinder.GapResult applyMaxGapGuidance(int[][] obstacleGrid,
+                                                     int srcR, int srcC,
+                                                     int tgtR, int tgtC) {
+    if (!maxGapFirstEnabled || obstacleGrid == null) {
+      return MaxGapFinder.GapResult.NOT_FOUND;
+    }
+    return MaxGapFinder.findMaxGap(obstacleGrid, srcR, srcC, tgtR, tgtC);
+  }
 
   // ═══════════════════════════════════════════════════════════════════════
   //  Helpers

@@ -416,18 +416,28 @@ public class BatchAutorouter extends NamedAlgorithm {
       // Multi-threaded deep copy via Java serialization is fragile on complex boards
       // (can throw NotSerializableException after heavy routing). For 1 thread the
       // board clone adds no value and only risks serialization failures.
-      if (job.routerSettings.maxThreads <= 1) {
+      int effectiveThreads = job.routerSettings.maxThreads;
+      if (effectiveThreads <= 1) {
         return autoroute_pass(p_pass_no);
       }
 
-      BatchAutorouterThread[] autorouterThreads = new BatchAutorouterThread[job.routerSettings.maxThreads];
+      // Dynamically reduce threads when remaining items are few — deep copy
+      // overhead (serialization) dominates when there's little work to parallelize.
+      int remainingItems = getAutorouteItems(this.board).size();
+      if (remainingItems < 50) {
+        effectiveThreads = Math.min(effectiveThreads, 2);
+      } else if (remainingItems < 200) {
+        effectiveThreads = Math.min(effectiveThreads, 3);
+      }
+
+      BatchAutorouterThread[] autorouterThreads = new BatchAutorouterThread[effectiveThreads];
       BoardHistory bh = new BoardHistory(job.routerSettings.scoring);
 
       // Start multiple instances of the following part in parallel, wait for the
       // results and keep only the best one
 
       // Prepare the threads
-      for (int threadIndex = 0; threadIndex < job.routerSettings.maxThreads; threadIndex++) {
+      for (int threadIndex = 0; threadIndex < effectiveThreads; threadIndex++) {
         // deep copy the board
         PerformanceProfiler.start("board.deepCopy");
         RoutingBoard clonedBoard = this.board.deepCopy();
@@ -457,13 +467,13 @@ public class BatchAutorouter extends NamedAlgorithm {
       });
 
       // Start the threads
-      for (int threadIndex = 0; threadIndex < job.routerSettings.maxThreads; threadIndex++) {
+      for (int threadIndex = 0; threadIndex < effectiveThreads; threadIndex++) {
         // start the thread
         autorouterThreads[threadIndex].start();
       }
 
       // Wait for the threads to finish
-      for (int threadIndex = 0; threadIndex < job.routerSettings.maxThreads; threadIndex++) {
+      for (int threadIndex = 0; threadIndex < effectiveThreads; threadIndex++) {
         BatchAutorouterThread autorouterThread = autorouterThreads[threadIndex];
 
         // wait for the thread to finish
@@ -498,7 +508,7 @@ public class BatchAutorouter extends NamedAlgorithm {
       float bestScore = -Float.MAX_VALUE;
 
       // Find the best thread
-      for (int i = 0; i < job.routerSettings.maxThreads; i++) {
+      for (int i = 0; i < effectiveThreads; i++) {
         BoardStatistics stats = autorouterThreads[i].getBoard().get_statistics();
         float score = stats.getNormalizedScore(job.routerSettings.scoring);
         if (score > bestScore) {
